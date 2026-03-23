@@ -1968,7 +1968,53 @@ def build_webhook_server(bot: SalonMaxBot, loop: asyncio.AbstractEventLoop) -> T
     MaxWebhookHandler.loop = loop
     MaxWebhookHandler.webhook_path = MAX_WEBHOOK_PATH
     MaxWebhookHandler.webhook_secret = MAX_WEBHOOK_SECRET
+    logger.info(
+        "🪝 Binding handler=%s webhook_path=%s host=%s port=%s",
+        MaxWebhookHandler.__name__,
+        MaxWebhookHandler.webhook_path,
+        MAX_WEBHOOK_HOST,
+        MAX_WEBHOOK_PORT,
+    )
     return ThreadingHTTPServer((MAX_WEBHOOK_HOST, MAX_WEBHOOK_PORT), MaxWebhookHandler)
+
+
+def local_http_get(url: str, timeout: int = 2) -> Dict[str, Any]:
+    try:
+        req = request.Request(url=url, method="GET")
+        with request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(body)
+            except Exception:
+                payload = {"raw": body}
+            return {
+                "ok": True,
+                "status": getattr(response, "status", 200),
+                "payload": payload,
+            }
+    except error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {"raw": body}
+        return {"ok": False, "status": exc.code, "payload": payload}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+async def run_local_selftests() -> None:
+    base = f"http://127.0.0.1:{MAX_WEBHOOK_PORT}"
+    urls = [
+        ("health", f"{base}/health"),
+        ("routes", f"{base}/debug/routes"),
+        ("webhook_get", f"{base}{MAX_WEBHOOK_PATH}"),
+    ]
+
+    await asyncio.sleep(0.25)
+    for label, url in urls:
+        result = await asyncio.to_thread(local_http_get, url, 2)
+        logger.info("🧪 Startup selftest %s -> %s", label, result)
 
 
 async def run_webhook_server(bot: SalonMaxBot) -> None:
@@ -2006,6 +2052,11 @@ async def run_webhook_server(bot: SalonMaxBot) -> None:
             "Внешний URL лучше задавать через MAX_WEBHOOK_URL или MAX_PUBLIC_BASE_URL.",
             MAX_WEBHOOK_PATH,
         )
+
+    await run_local_selftests()
+    logger.info(
+        "ℹ️ Если startup selftest успешен, а внешний URL отвечает иначе, проблема находится вне Python-кода: в proxy/route/bind настройке хостинга."
+    )
 
     stop_event = asyncio.Event()
     try:
