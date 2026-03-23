@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Sequence
-from urllib import error, request
+from urllib import error, parse, request
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -68,6 +68,7 @@ def env_bool(name: str, default: bool = False) -> bool:
         return default
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
 def env_int(name: str, default: int) -> int:
     value = os.getenv(name)
     if value is None or not value.strip():
@@ -91,6 +92,36 @@ def parse_admin_ids(value: str) -> List[int]:
     return result
 
 
+def normalize_webhook_path(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return "/max/webhook"
+
+    if raw.startswith("http://") or raw.startswith("https://"):
+        parsed = parse.urlparse(raw)
+        path = (parsed.path or "/max/webhook").strip()
+    else:
+        path = raw
+
+    if not path.startswith("/"):
+        path = f"/{path}"
+
+    return path
+
+
+def build_public_webhook_url(host: str, port: int, path: str) -> str:
+    public_base = os.getenv("MAX_PUBLIC_BASE_URL", "").strip().rstrip("/")
+    explicit_url = os.getenv("MAX_WEBHOOK_URL", "").strip()
+
+    if explicit_url:
+        return explicit_url
+
+    if public_base:
+        return f"{public_base}{path}"
+
+    return f"http://{host}:{port}{path}"
+
+
 # ------------------------------
 # Runtime configuration
 # ------------------------------
@@ -100,15 +131,18 @@ MAX_SEND_MESSAGE_URL = os.getenv("MAX_SEND_MESSAGE_URL", "").strip()
 MAX_EDIT_MESSAGE_URL = os.getenv("MAX_EDIT_MESSAGE_URL", "").strip()
 MAX_ACK_ACTION_URL = os.getenv("MAX_ACK_ACTION_URL", "").strip()
 MAX_SET_COMMANDS_URL = os.getenv("MAX_SET_COMMANDS_URL", "").strip()
+MAX_GET_ME_URL = os.getenv("MAX_GET_ME_URL", "").strip()
 MAX_WEBHOOK_HOST = os.getenv("MAX_WEBHOOK_HOST", "0.0.0.0").strip() or "0.0.0.0"
 MAX_WEBHOOK_PORT = env_int("MAX_WEBHOOK_PORT", 8080)
-MAX_WEBHOOK_PATH = os.getenv("MAX_WEBHOOK_PATH", "/max/webhook").strip() or "/max/webhook"
+MAX_WEBHOOK_PATH = normalize_webhook_path(os.getenv("MAX_WEBHOOK_PATH", "/max/webhook"))
 MAX_WEBHOOK_SECRET = os.getenv("MAX_WEBHOOK_SECRET", "").strip()
-MAX_HTTP_TIMEOUT = env_int("MAX_HTTP_TIMEOUT", 20)
+MAX_HTTP_TIMEOUT = env_int("MAX_HTTP_TIMEOUT", 8)
 MAX_AUTH_HEADER = os.getenv("MAX_AUTH_HEADER", "Authorization").strip() or "Authorization"
 MAX_AUTH_PREFIX = os.getenv("MAX_AUTH_PREFIX", "Bearer").strip()
 MAX_DRY_RUN = env_bool("MAX_DRY_RUN", False)
 MAX_MODE = os.getenv("MAX_MODE", "webhook").strip().lower() or "webhook"
+MAX_SKIP_COMMANDS_SETUP = env_bool("MAX_SKIP_COMMANDS_SETUP", True)
+MAX_SKIP_STARTUP_PROBE = env_bool("MAX_SKIP_STARTUP_PROBE", True)
 TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow").strip() or "Europe/Moscow"
 DATABASE_PATH = os.getenv("DATABASE_PATH", "salon.db").strip() or "salon.db"
 
@@ -470,6 +504,9 @@ class MaxAdapter:
     async def set_commands(self, commands: List[Dict[str, str]]) -> Any:
         raise NotImplementedError
 
+    async def get_me(self) -> Any:
+        raise NotImplementedError
+
 
 class HttpMaxAdapter(MaxAdapter):
     def __init__(self, token: str) -> None:
@@ -482,8 +519,10 @@ class HttpMaxAdapter(MaxAdapter):
             return f"{MAX_API_BASE_URL}{fallback_path}"
         return ""
 
-    def _headers(self) -> Dict[str, str]:
-        headers = {"Content-Type": "application/json; charset=utf-8"}
+    def _headers(self, include_content_type: bool = True) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        if include_content_type:
+            headers["Content-Type"] = "application/json; charset=utf-8"
         if self.token:
             if MAX_AUTH_PREFIX:
                 headers[MAX_AUTH_HEADER] = f"{MAX_AUTH_PREFIX} {self.token}"
@@ -491,24 +530,69 @@ class HttpMaxAdapter(MaxAdapter):
                 headers[MAX_AUTH_HEADER] = self.token
         return headers
 
+    def _decode_response(self, response: Any) -> Any:
+        raw = response.read().decode("utf-8") if response else ""
+        if not raw:
+            return {"ok": True}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {"ok": True, "raw": raw}
+
     def _post_json_sync(self, url: str, payload: Dict[str, Any]) -> Any:
         if MAX_DRY_RUN or not url:
             logger.info("DRY RUN POST -> %s | payload=%s", url or "<missing-url>", payload)
             return {"ok": True, "dry_run": True}
 
         body = json.dumps(payload).encode("utf-8")
-        req = request.Request(url=url, data=body, headers=self._headers(), method="POST")
-        with request.urlopen(req, timeout=MAX_HTTP_TIMEOUT) as response:
-            raw = response.read().decode("utf-8") if response else ""
-            if not raw:
-                return {"ok": True}
+        req = request.Request(url=url, data=body, headers=self._headers(include_content_type=True), method="POST")
+        try:
+            with request.urlopen(req, timeout=MAX_HTTP_TIMEOUT) as response:
+                return self._decode_response(response)
+        except error.HTTPError as exc:
+            response_text = ""
             try:
-                return json.loads(raw)
-            except json.JSONDecodeError:
-                return {"ok": True, "raw": raw}
+                response_text = exc.read().decode("utf-8")
+            except Exception:
+                response_text = ""
+            logger.error("HTTP %s при POST %s | response=%s", exc.code, url, response_text[:1000])
+            raise
+        except TimeoutError:
+            logger.error("Timeout при POST %s (timeout=%ss)", url, MAX_HTTP_TIMEOUT)
+            raise
+        except Exception as exc:
+            logger.error("Ошибка POST %s: %s", url, exc)
+            raise
+
+    def _get_json_sync(self, url: str) -> Any:
+        if MAX_DRY_RUN or not url:
+            logger.info("DRY RUN GET -> %s", url or "<missing-url>")
+            return {"ok": True, "dry_run": True}
+
+        req = request.Request(url=url, headers=self._headers(include_content_type=False), method="GET")
+        try:
+            with request.urlopen(req, timeout=MAX_HTTP_TIMEOUT) as response:
+                return self._decode_response(response)
+        except error.HTTPError as exc:
+            response_text = ""
+            try:
+                response_text = exc.read().decode("utf-8")
+            except Exception:
+                response_text = ""
+            logger.error("HTTP %s при GET %s | response=%s", exc.code, url, response_text[:1000])
+            raise
+        except TimeoutError:
+            logger.error("Timeout при GET %s (timeout=%ss)", url, MAX_HTTP_TIMEOUT)
+            raise
+        except Exception as exc:
+            logger.error("Ошибка GET %s: %s", url, exc)
+            raise
 
     async def _post_json(self, url: str, payload: Dict[str, Any]) -> Any:
         return await asyncio.to_thread(self._post_json_sync, url, payload)
+
+    async def _get_json(self, url: str) -> Any:
+        return await asyncio.to_thread(self._get_json_sync, url)
 
     async def send_text(self, chat_id: Any, text: str, actions: Optional[List[List[Dict[str, str]]]] = None) -> Any:
         url = self._compose_url(MAX_SEND_MESSAGE_URL, "/messages/send")
@@ -561,6 +645,13 @@ class HttpMaxAdapter(MaxAdapter):
             logger.info("SET COMMANDS skipped: no endpoint configured")
             return {"ok": True, "skipped": True}
         return await self._post_json(url, {"commands": commands})
+
+    async def get_me(self) -> Any:
+        url = self._compose_url(MAX_GET_ME_URL, "/bot/me")
+        if not url:
+            logger.info("GET ME skipped: no endpoint configured")
+            return {"ok": True, "skipped": True}
+        return await self._get_json(url)
 
 
 # ------------------------------
@@ -757,8 +848,23 @@ class SalonMaxBot:
         self.scheduler: Optional[AsyncIOScheduler] = None
 
     async def setup(self) -> None:
-        await self.adapter.set_commands(COMMANDS)
-        logger.info("✅ Команды бота подготовлены")
+        if MAX_SKIP_COMMANDS_SETUP:
+            logger.info("⏭ Настройка команд пропущена: MAX_SKIP_COMMANDS_SETUP=1")
+        else:
+            try:
+                await self.adapter.set_commands(COMMANDS)
+                logger.info("✅ Команды бота подготовлены")
+            except Exception as exc:
+                logger.error("❌ Ошибка настройки команд MAX: %s", exc)
+
+        if MAX_SKIP_STARTUP_PROBE:
+            logger.info("⏭ Startup probe пропущен: MAX_SKIP_STARTUP_PROBE=1")
+        else:
+            try:
+                me = await self.adapter.get_me()
+                logger.info("✅ MAX get_me выполнен: %s", me)
+            except Exception as exc:
+                logger.error("❌ Ошибка startup probe MAX: %s", exc)
 
     async def handle_update(self, incoming_update: Dict[str, Any]) -> None:
         update = normalize_max_update(incoming_update)
@@ -1784,8 +1890,21 @@ async def run_webhook_server(bot: SalonMaxBot) -> None:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    logger.info("🌐 MAX webhook server started: http://%s:%s%s", MAX_WEBHOOK_HOST, MAX_WEBHOOK_PORT, MAX_WEBHOOK_PATH)
-    logger.info("💓 Healthcheck: http://%s:%s/health", MAX_WEBHOOK_HOST, MAX_WEBHOOK_PORT)
+    bind_url = f"http://{MAX_WEBHOOK_HOST}:{MAX_WEBHOOK_PORT}{MAX_WEBHOOK_PATH}"
+    public_webhook_url = build_public_webhook_url(MAX_WEBHOOK_HOST, MAX_WEBHOOK_PORT, MAX_WEBHOOK_PATH)
+    health_url = f"http://{MAX_WEBHOOK_HOST}:{MAX_WEBHOOK_PORT}/health"
+
+    logger.info("🌐 MAX webhook server bind: %s", bind_url)
+    logger.info("🌍 MAX webhook public URL: %s", public_webhook_url)
+    logger.info("💓 Healthcheck: %s", health_url)
+
+    raw_webhook_path = os.getenv("MAX_WEBHOOK_PATH", "").strip()
+    if raw_webhook_path.startswith("http://") or raw_webhook_path.startswith("https://"):
+        logger.warning(
+            "⚠️ В MAX_WEBHOOK_PATH был передан полный URL. Использую только path=%s для локального сервера. "
+            "Внешний URL лучше задавать через MAX_WEBHOOK_URL или MAX_PUBLIC_BASE_URL.",
+            MAX_WEBHOOK_PATH,
+        )
 
     stop_event = asyncio.Event()
     try:
@@ -1824,6 +1943,25 @@ async def run() -> None:
         raise RuntimeError(
             "Не найден MAX_BOT_TOKEN. Добавьте его в .env или включите MAX_DRY_RUN=1 для локального тестирования логики."
         )
+
+    logger.info("🚀 Запуск MAX-бота...")
+    logger.info(
+        "⚙️ Конфиг MAX: mode=%s dry_run=%s timeout=%ss skip_commands=%s skip_probe=%s",
+        MAX_MODE,
+        MAX_DRY_RUN,
+        MAX_HTTP_TIMEOUT,
+        MAX_SKIP_COMMANDS_SETUP,
+        MAX_SKIP_STARTUP_PROBE,
+    )
+    logger.info(
+        "🔗 Endpoint-ы: base=%s send=%s edit=%s ack=%s commands=%s me=%s",
+        MAX_API_BASE_URL or "<empty>",
+        MAX_SEND_MESSAGE_URL or "<auto>",
+        MAX_EDIT_MESSAGE_URL or "<auto>",
+        MAX_ACK_ACTION_URL or "<auto>",
+        MAX_SET_COMMANDS_URL or "<auto>",
+        MAX_GET_ME_URL or "<auto>",
+    )
 
     init_db()
 
