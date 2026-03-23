@@ -58,6 +58,9 @@ def load_env_file(env_path: str = ".env") -> None:
 
 load_env_file()
 
+APP_BUILD_ID = "2026-03-23-routes-v2"
+APP_FILE_PATH = os.path.abspath(__file__)
+
 
 # ------------------------------
 # Config helpers
@@ -118,6 +121,9 @@ def build_public_webhook_url(host: str, port: int, path: str) -> str:
 
     if public_base:
         return f"{public_base}{path}"
+
+    if host in {"0.0.0.0", "127.0.0.1", "localhost", "::", "[::]"}:
+        return ""
 
     return f"http://{host}:{port}{path}"
 
@@ -1835,25 +1841,50 @@ class MaxWebhookHandler(BaseHTTPRequestHandler):
         return header_value == self.webhook_secret
 
     def do_POST(self) -> None:
+        logger.info(
+            "⬇️ HTTP POST path=%s content_length=%s user_agent=%s",
+            self.path,
+            self.headers.get("Content-Length", "0"),
+            self.headers.get("User-Agent", ""),
+        )
+
         if self.path != self.webhook_path:
-            self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {
+                    "ok": False,
+                    "error": "not_found",
+                    "expected_path": self.webhook_path,
+                    "handler": "max_salon_bot",
+                },
+            )
             return
 
         if not self._is_secret_valid():
-            self._send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "invalid_secret"})
+            self._send_json(
+                HTTPStatus.FORBIDDEN,
+                {"ok": False, "error": "invalid_secret", "handler": "max_salon_bot"},
+            )
             return
 
         if not self.bot or not self.loop:
-            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"ok": False, "error": "bot_not_ready"})
+            self._send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"ok": False, "error": "bot_not_ready", "handler": "max_salon_bot"},
+            )
             return
 
         try:
             content_length = int(self.headers.get("Content-Length", "0") or "0")
             raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            logger.info("📦 Webhook raw body preview: %s", raw_body[:500].decode("utf-8", errors="replace"))
             payload = json.loads(raw_body.decode("utf-8") or "{}")
         except Exception as exc:
             logger.error("Ошибка чтения webhook payload: %s", exc, exc_info=True)
-            self._send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_json"})
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "invalid_json", "handler": "max_salon_bot"},
+            )
             return
 
         future = asyncio.run_coroutine_threadsafe(self.bot.handle_update(payload), self.loop)
@@ -1861,16 +1892,72 @@ class MaxWebhookHandler(BaseHTTPRequestHandler):
             future.result(timeout=15)
         except Exception as exc:
             logger.error("Ошибка обработки webhook update: %s", exc, exc_info=True)
-            self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": "update_failed"})
+            self._send_json(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                {"ok": False, "error": "update_failed", "handler": "max_salon_bot"},
+            )
             return
 
-        self._send_json(HTTPStatus.OK, {"ok": True})
+        self._send_json(HTTPStatus.OK, {"ok": True, "handler": "max_salon_bot"})
 
     def do_GET(self) -> None:
-        if self.path == "/health":
-            self._send_json(HTTPStatus.OK, {"ok": True, "status": "healthy"})
+        logger.info("⬇️ HTTP GET path=%s user_agent=%s", self.path, self.headers.get("User-Agent", ""))
+
+        if self.path == self.webhook_path:
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "status": "webhook_ready",
+                    "service": "max_salon_bot",
+                    "handler": "max_salon_bot",
+                    "webhook_path": self.webhook_path,
+                    "method": "GET",
+                    "hint": "Use POST with JSON update payload to deliver MAX events.",
+                    "build_id": APP_BUILD_ID,
+                    "file": APP_FILE_PATH,
+                },
+            )
             return
-        self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+
+        if self.path == "/health":
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "status": "healthy",
+                    "service": "max_salon_bot",
+                    "handler": "max_salon_bot",
+                    "webhook_path": self.webhook_path,
+                    "build_id": APP_BUILD_ID,
+                    "file": APP_FILE_PATH,
+                },
+            )
+            return
+
+        if self.path == "/debug/routes":
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "service": "max_salon_bot",
+                    "handler": "max_salon_bot",
+                    "build_id": APP_BUILD_ID,
+                    "file": APP_FILE_PATH,
+                    "routes": [self.webhook_path, "/health", "/debug/routes"],
+                },
+            )
+            return
+
+        self._send_json(
+            HTTPStatus.NOT_FOUND,
+            {
+                "ok": False,
+                "error": "not_found",
+                "handler": "max_salon_bot",
+                "known_routes": [self.webhook_path, "/health", "/debug/routes"],
+            },
+        )
 
     def log_message(self, format: str, *args: Any) -> None:
         logger.info("WEBHOOK %s - %s", self.address_string(), format % args)
@@ -1895,8 +1982,22 @@ async def run_webhook_server(bot: SalonMaxBot) -> None:
     health_url = f"http://{MAX_WEBHOOK_HOST}:{MAX_WEBHOOK_PORT}/health"
 
     logger.info("🌐 MAX webhook server bind: %s", bind_url)
-    logger.info("🌍 MAX webhook public URL: %s", public_webhook_url)
+    if public_webhook_url:
+        logger.info("🌍 MAX webhook public URL: %s", public_webhook_url)
+        logger.info("🧪 MAX debug routes URL: %s/debug/routes", public_webhook_url.rsplit(MAX_WEBHOOK_PATH, 1)[0])
+    else:
+        logger.warning(
+            "⚠️ Публичный webhook URL не задан. Укажите MAX_WEBHOOK_URL или MAX_PUBLIC_BASE_URL, "
+            "если MAX должен обращаться к боту извне."
+        )
     logger.info("💓 Healthcheck: %s", health_url)
+    logger.info("🧪 Local health test: curl -i http://127.0.0.1:%s/health", MAX_WEBHOOK_PORT)
+    logger.info("🧪 Local routes test: curl -i http://127.0.0.1:%s/debug/routes", MAX_WEBHOOK_PORT)
+    logger.info(
+        "🧪 Local webhook GET test: curl -i http://127.0.0.1:%s%s",
+        MAX_WEBHOOK_PORT,
+        MAX_WEBHOOK_PATH,
+    )
 
     raw_webhook_path = os.getenv("MAX_WEBHOOK_PATH", "").strip()
     if raw_webhook_path.startswith("http://") or raw_webhook_path.startswith("https://"):
@@ -1945,6 +2046,7 @@ async def run() -> None:
         )
 
     logger.info("🚀 Запуск MAX-бота...")
+    logger.info("🧩 Build: %s | file=%s", APP_BUILD_ID, APP_FILE_PATH)
     logger.info(
         "⚙️ Конфиг MAX: mode=%s dry_run=%s timeout=%ss skip_commands=%s skip_probe=%s",
         MAX_MODE,
