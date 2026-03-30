@@ -1,0 +1,2 @@
+maxapi[fastapi]
+apscheduler
