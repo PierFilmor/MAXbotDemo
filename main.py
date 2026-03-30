@@ -13,7 +13,8 @@ from dotenv import load_dotenv
 # Загрузка переменных окружения
 load_dotenv()
 
-from maxapi import Bot, Dispatcher, MessageCallback
+from maxapi import Bot, Dispatcher
+from maxapi.types import MessageCreated, Command, BotStarted, MessageCallback
 from maxapi.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 # Импорт базы данных
@@ -278,7 +279,7 @@ async def callback_masters_list(event: MessageCallback):
 @dp.message_callback()
 async def callback_select_service(event: MessageCallback):
     """Выбор услуги"""
-    service_id = int(event.data.split('_')[-1])
+    service_id = int(event.callback.payload.split('_')[-1])
     service = get_service(service_id)
     
     if not service:
@@ -298,7 +299,7 @@ async def callback_select_service(event: MessageCallback):
 @dp.message_callback()
 async def callback_select_master(event: MessageCallback):
     """Выбор мастера"""
-    master_id = int(event.data.split('_')[-1])
+    master_id = int(event.callback.payload.split('_')[-1])
     master = get_master(master_id)
     
     if not master:
@@ -316,7 +317,7 @@ async def callback_select_master(event: MessageCallback):
 @dp.message_callback()
 async def callback_select_time(event: MessageCallback):
     """Выбор времени"""
-    datetime_str = event.data.split('_')[-1]
+    datetime_str = event.callback.payload.split('_')[-1]
     try:
         appointment_time = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M")
     except ValueError:
