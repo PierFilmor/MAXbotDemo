@@ -445,7 +445,7 @@ async def select_time(event: MessageCallback):
     service_id = int(parts[2])
     master_id = int(parts[3])
     
-    user_id = event.chat_id
+    user_id = event.message.chat_id
     
     # Получаем данные услуги и мастера
     services = get_services()
