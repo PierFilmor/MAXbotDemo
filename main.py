@@ -8,9 +8,17 @@ from typing import Any, Dict, List, Optional, Sequence
 from urllib.parse import urlparse
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from maxapi import Bot, Dispatcher, F
-from maxapi.types import BotCommand, BotStarted, CallbackButton, MessageCallback, MessageCreated
-from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
+
+try:
+    from maxapi import Bot, Dispatcher, F
+    from maxapi.types import BotCommand, BotStarted, CallbackButton, MessageCallback, MessageCreated
+    from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
+except ModuleNotFoundError as exc:
+    if getattr(exc, "name", "") == "maxapi":
+        raise SystemExit(
+            "Не найден Python-пакет 'maxapi'. Установите зависимости командой: pip install -r requirements.txt"
+        ) from exc
+    raise
 
 
 # ============================================================
