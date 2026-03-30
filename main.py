@@ -243,7 +243,7 @@ async def bot_started(event: BotStarted):
 @dp.message_created(Command('start'))
 async def cmd_start(event: MessageCreated):
     """Обработчик команды /start"""
-    user_id = event.from_user.id
+    user_id = event.chat.id
     
     # Добавляем пользователя в базу данных
     add_user(user_id, event.from_user.first_name, event.from_user.last_name or "")
@@ -267,7 +267,7 @@ async def cmd_menu(event: MessageCreated):
 @dp.message_created(Command('my_appointments'))
 async def cmd_my_appointments(event: MessageCreated):
     """Показать записи пользователя"""
-    user_id = event.from_user.id
+    user_id = event.chat.id
     appointments = get_user_appointments(user_id)
     
     if not appointments:
@@ -325,7 +325,7 @@ async def cmd_masters(event: MessageCreated):
 @dp.message_created(Command('admin'))
 async def cmd_admin(event: MessageCreated):
     """Админ панель"""
-    user_id = event.from_user.id
+    user_id = event.chat.id
     
     if not is_admin(user_id):
         await event.message.answer("❌ Доступ запрещен. Только для администраторов.")
@@ -353,7 +353,7 @@ async def menu_book(event: MessageCallback):
 async def menu_my_appointments(event: MessageCallback):
     """Показать записи пользователя"""
     await event.message.delete()
-    user_id = event.from_user.id
+    user_id = event.chat.id
     appointments = get_user_appointments(user_id)
     
     if not appointments:
@@ -445,7 +445,7 @@ async def select_time(event: MessageCallback):
     service_id = int(parts[2])
     master_id = int(parts[3])
     
-    user_id = event.from_user.id
+    user_id = event.chat.id
     
     # Получаем данные услуги и мастера
     services = get_services()
@@ -527,7 +527,7 @@ async def cancel_appointment_client(event: MessageCallback):
         await event.message.answer("❌ Запись не найдена.")
         return
     
-    if appointment['user_id'] != event.from_user.id:
+    if appointment['user_id'] != event.chat.id:
         await event.message.answer("❌ Вы не можете отменить эту запись.")
         return
     
@@ -560,7 +560,7 @@ async def cancel_appointment_client(event: MessageCallback):
 
 @dp.message_callback(F.callback.payload.startswith("no_call_"))
 async def no_call_confirmation(event: MessageCallback):
-    """Отметка 'Не звонить для подтверждения'"""
+    """Отметка 'Не звонить для подтверждения'""""
     appointment_id = int(event.callback.payload.split("_")[1])
     appointment = get_appointment_by_id(appointment_id)
     
@@ -620,7 +620,7 @@ async def back_to_masters(event: MessageCallback):
 @dp.message_callback(F.callback.payload == "admin_pending")
 async def admin_pending(event: MessageCallback):
     """Показать ожидающие записи"""
-    user_id = event.from_user.id
+    user_id = event.chat.id
     
     if not is_admin(user_id):
         await event.message.answer("❌ Доступ запрещен.")
@@ -651,7 +651,7 @@ async def admin_pending(event: MessageCallback):
 @dp.message_callback(F.callback.payload == "admin_confirmed")
 async def admin_confirmed(event: MessageCallback):
     """Показать подтвержденные записи"""
-    user_id = event.from_user.id
+    user_id = event.chat.id
     
     if not is_admin(user_id):
         await event.message.answer("❌ Доступ запрещен.")
@@ -682,7 +682,7 @@ async def admin_confirmed(event: MessageCallback):
 @dp.message_callback(F.callback.payload == "admin_cancelled")
 async def admin_cancelled(event: MessageCallback):
     """Показать отмененные записи"""
-    user_id = event.from_user.id
+    user_id = event.chat.id
     
     if not is_admin(user_id):
         await event.message.answer("❌ Доступ запрещен.")
@@ -713,7 +713,7 @@ async def admin_cancelled(event: MessageCallback):
 @dp.message_callback(F.callback.payload == "admin_all")
 async def admin_all(event: MessageCallback):
     """Показать все записи"""
-    user_id = event.from_user.id
+    user_id = event.chat.id
     
     if not is_admin(user_id):
         await event.message.answer("❌ Доступ запрещен.")
