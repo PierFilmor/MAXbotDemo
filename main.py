@@ -560,7 +560,7 @@ async def cancel_appointment_client(event: MessageCallback):
 
 @dp.message_callback(F.callback.payload.startswith("no_call_"))
 async def no_call_confirmation(event: MessageCallback):
-    """Отметка 'Не звонить для подтверждения'"""
+    """Отметка 'Не звонить для подтверждения'""""
     appointment_id = int(event.callback.payload.split("_")[1])
     appointment = get_appointment_by_id(appointment_id)
     
