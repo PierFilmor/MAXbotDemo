@@ -1,633 +1,1006 @@
-"""
-Бот для записи в салон красоты MAX
-Функции: приветствие, запись, отмена, уведомления, админ панель
-"""
-
-import os
 import asyncio
+import json
 import logging
+import os
+import sqlite3
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any
+from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
+from fastapi import FastAPI
+from maxapi import Bot, Dispatcher, F
+from maxapi.types import BotStarted, CallbackButton, LinkButton, MessageCallback, MessageCreated
+from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
+from maxapi.webhook.fastapi import FastAPIMaxWebhook
 
-# Загрузка переменных окружения
 load_dotenv()
-
-from maxapi import Bot, Dispatcher, MessageCallback
-from maxapi.types import InlineKeyboardButton, InlineKeyboardMarkup
-
-# Импорт базы данных
-from database import (
-    init_db, add_user, get_user, set_user_phone, set_admin,
-    get_all_services, get_service, get_all_masters, get_master,
-    create_appointment, get_appointment, get_user_appointments,
-    get_all_appointments, update_appointment_status, confirm_appointment,
-    set_dont_call, get_pending_appointments, get_confirmed_appointments,
-    get_cancelled_appointments, get_appointments_needing_notification,
-    add_notification, get_admin, get_all_users
-)
-
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Инициализация бота
-BOT_TOKEN = os.getenv('MAX_BOT_TOKEN')
-WEBHOOK_URL = os.getenv('MAX_WEBHOOK_URL')
-ADMIN_USER_IDS = [int(id) for id in os.getenv('ADMIN_USER_IDS', '').split(',') if id.strip()]
+TZ = ZoneInfo(os.getenv("SALON_TIMEZONE", "Europe/Moscow"))
+DB_PATH = os.getenv("DB_PATH", "salon.db")
+SALON_NAME = os.getenv("SALON_NAME", "Style & Beauty")
+SALON_ADDRESS = os.getenv("SALON_ADDRESS", "Москва, ул. Примерная, 10")
+SALON_PHONE = os.getenv("SALON_PHONE", "+7 (999) 000-00-00")
+SALON_SITE = os.getenv("SALON_SITE", "https://example.com")
+SALON_WORKING_HOURS = os.getenv("SALON_WORKING_HOURS", "10:00–21:00")
+STAFF_CHAT_IDS = {
+    int(value.strip())
+    for value in os.getenv("STAFF_CHAT_IDS", "").split(",")
+    if value.strip()
+}
 
-if not BOT_TOKEN:
-    raise ValueError("MAX_BOT_TOKEN не установлен в переменных окружения")
+SERVICES = {
+    "haircut": {"title": "Женская стрижка", "price": "2500 ₽"},
+    "coloring": {"title": "Окрашивание", "price": "4500 ₽"},
+    "manicure": {"title": "Маникюр", "price": "2200 ₽"},
+    "brows": {"title": "Брови и ресницы", "price": "1800 ₽"},
+}
 
-bot = Bot(token=BOT_TOKEN)
+MASTERS = {
+    "anna": "Анна",
+    "maria": "Мария",
+    "sofia": "София",
+}
+
+WORKING_SLOTS = ["10:00", "12:00", "14:00", "16:00", "18:00", "20:00"]
+
+bot = Bot()
 dp = Dispatcher()
+webhook = FastAPIMaxWebhook(dp=dp, bot=bot)
+reminder_task: asyncio.Task | None = None
 
-# --- Клавиатуры ---
 
-def get_main_keyboard():
-    """Главное меню"""
-    buttons = [
-        [InlineKeyboardButton(text="📅 Записаться", callback_data="book_appointment")],
-        [InlineKeyboardButton(text="📋 Мои записи", callback_data="my_appointments")],
-        [InlineKeyboardButton(text="ℹ️ О салоне", callback_data="about_salon")],
-        [InlineKeyboardButton(text="👨‍🔧 Мастера", callback_data="masters_list")],
+def now_local() -> datetime:
+    return datetime.now(TZ)
+
+
+def parse_dt(value: str) -> datetime:
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=TZ)
+
+
+def format_dt(value: str) -> str:
+    dt = parse_dt(value)
+    return dt.strftime("%d.%m.%Y %H:%M")
+
+
+def format_dt_short(value: str) -> str:
+    dt = parse_dt(value)
+    return dt.strftime("%d.%m %H:%M")
+
+
+def service_title(service_key: str) -> str:
+    return SERVICES.get(service_key, {}).get("title", service_key)
+
+
+def service_price(service_key: str) -> str:
+    return SERVICES.get(service_key, {}).get("price", "по запросу")
+
+
+def master_title(master_key: str) -> str:
+    return MASTERS.get(master_key, master_key)
+
+
+def get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with get_conn() as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS client_prefs (
+                chat_id INTEGER PRIMARY KEY,
+                no_call_confirm INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_state (
+                chat_id INTEGER PRIMARY KEY,
+                state TEXT NOT NULL,
+                data_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS appointments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_chat_id INTEGER NOT NULL,
+                client_user_id INTEGER,
+                client_name TEXT NOT NULL,
+                phone TEXT NOT NULL,
+                service_key TEXT NOT NULL,
+                master_key TEXT NOT NULL,
+                starts_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'booked',
+                no_call_confirm INTEGER NOT NULL DEFAULT 0,
+                reminder24_sent INTEGER NOT NULL DEFAULT 0,
+                reminder2_sent INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                cancelled_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_appointments_starts_at ON appointments(starts_at)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_appointments_client_chat_id ON appointments(client_chat_id)"
+        )
+        conn.commit()
+
+
+def get_no_call_pref(chat_id: int) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT no_call_confirm FROM client_prefs WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+    return bool(row["no_call_confirm"]) if row else False
+
+
+def set_no_call_pref(chat_id: int, value: bool) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO client_prefs(chat_id, no_call_confirm)
+            VALUES(?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET no_call_confirm = excluded.no_call_confirm
+            """,
+            (chat_id, int(value)),
+        )
+        conn.commit()
+
+
+def toggle_no_call_pref(chat_id: int) -> bool:
+    current = get_no_call_pref(chat_id)
+    new_value = not current
+    set_no_call_pref(chat_id, new_value)
+    return new_value
+
+
+def get_state(chat_id: int) -> tuple[str | None, dict[str, Any]]:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT state, data_json FROM user_state WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+    if not row:
+        return None, {}
+    return row["state"], json.loads(row["data_json"] or "{}")
+
+
+def set_state(chat_id: int, state: str, data: dict[str, Any] | None = None) -> None:
+    payload = json.dumps(data or {}, ensure_ascii=False)
+    with get_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_state(chat_id, state, data_json)
+            VALUES(?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET state = excluded.state, data_json = excluded.data_json
+            """,
+            (chat_id, state, payload),
+        )
+        conn.commit()
+
+
+def clear_state(chat_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM user_state WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+
+
+def slot_is_taken(master_key: str, starts_at: str) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM appointments
+            WHERE master_key = ? AND starts_at = ? AND status = 'booked'
+            LIMIT 1
+            """,
+            (master_key, starts_at),
+        ).fetchone()
+    return row is not None
+
+
+def create_appointment(
+    *,
+    client_chat_id: int,
+    client_user_id: int | None,
+    client_name: str,
+    phone: str,
+    service_key: str,
+    master_key: str,
+    starts_at: str,
+    no_call_confirm: bool,
+) -> sqlite3.Row:
+    with get_conn() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO appointments(
+                client_chat_id,
+                client_user_id,
+                client_name,
+                phone,
+                service_key,
+                master_key,
+                starts_at,
+                no_call_confirm,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                client_chat_id,
+                client_user_id,
+                client_name,
+                phone,
+                service_key,
+                master_key,
+                starts_at,
+                int(no_call_confirm),
+                now_local().isoformat(),
+            ),
+        )
+        appointment_id = cursor.lastrowid
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM appointments WHERE id = ?",
+            (appointment_id,),
+        ).fetchone()
+    return row
+
+
+def get_user_active_appointments(chat_id: int) -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM appointments
+            WHERE client_chat_id = ? AND status = 'booked' AND starts_at >= ?
+            ORDER BY starts_at ASC
+            """,
+            (chat_id, now_local().isoformat()),
+        ).fetchall()
+    return rows
+
+
+def get_future_appointments() -> list[sqlite3.Row]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM appointments
+            WHERE starts_at >= ?
+            ORDER BY starts_at ASC
+            """,
+            (now_local().isoformat(),),
+        ).fetchall()
+    return rows
+
+
+def get_today_appointments() -> list[sqlite3.Row]:
+    start = now_local().replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM appointments
+            WHERE starts_at >= ? AND starts_at < ?
+            ORDER BY starts_at ASC
+            """,
+            (start.isoformat(), end.isoformat()),
+        ).fetchall()
+    return rows
+
+
+def get_appointment(appointment_id: int) -> sqlite3.Row | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM appointments WHERE id = ?",
+            (appointment_id,),
+        ).fetchone()
+    return row
+
+
+def cancel_appointment(appointment_id: int) -> sqlite3.Row | None:
+    row = get_appointment(appointment_id)
+    if not row or row["status"] != "booked":
+        return None
+
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE appointments
+            SET status = 'cancelled', cancelled_at = ?
+            WHERE id = ?
+            """,
+            (now_local().isoformat(), appointment_id),
+        )
+        conn.commit()
+        updated = conn.execute(
+            "SELECT * FROM appointments WHERE id = ?",
+            (appointment_id,),
+        ).fetchone()
+    return updated
+
+
+def mark_reminder_sent(appointment_id: int, reminder_type: int) -> None:
+    column = "reminder24_sent" if reminder_type == 24 else "reminder2_sent"
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE appointments SET {column} = 1 WHERE id = ?",
+            (appointment_id,),
+        )
+        conn.commit()
+
+
+def reminder_text(row: sqlite3.Row, hours: int) -> str:
+    no_call_text = (
+        "Мы учли вашу настройку: не звонить для подтверждения записи."
+        if row["no_call_confirm"]
+        else "Если планы изменились — откройте бота и отмените запись заранее."
+    )
+    return (
+        f"Напоминание: до визита осталось {hours} ч.\n\n"
+        f"Салон: {SALON_NAME}\n"
+        f"Услуга: {service_title(row['service_key'])}\n"
+        f"Мастер: {master_title(row['master_key'])}\n"
+        f"Когда: {format_dt(row['starts_at'])}\n"
+        f"Адрес: {SALON_ADDRESS}\n\n"
+        f"{no_call_text}"
+    )
+
+
+def appointment_text(row: sqlite3.Row, include_client: bool = True) -> str:
+    lines = [
+        f"Запись №{row['id']}",
+        f"Услуга: {service_title(row['service_key'])}",
+        f"Мастер: {master_title(row['master_key'])}",
+        f"Когда: {format_dt(row['starts_at'])}",
+        f"Статус: {'активна' if row['status'] == 'booked' else 'отменена'}",
+        f"Подтверждение: {'не звонить' if row['no_call_confirm'] else 'можно звонить'}",
     ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    if include_client:
+        lines.insert(1, f"Клиент: {row['client_name']}")
+        lines.insert(2, f"Телефон: {row['phone']}")
+    return "\n".join(lines)
 
-def get_services_keyboard():
-    """Клавиатура с услугами"""
-    services = get_all_services()
-    buttons = []
-    for service in services:
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"💇‍♀️ {service['name']} - {service['price']}₽",
-                callback_data=f"select_service_{service['id']}"
+
+def about_text() -> str:
+    prices = "\n".join(
+        f"• {item['title']} — {item['price']}" for item in SERVICES.values()
+    )
+    return (
+        f"{SALON_NAME}\n\n"
+        f"Добро пожаловать! Я помогу записаться в салон красоты, покажу ваши записи,"
+        f" отменю визит и пришлю напоминание за 24 и 2 часа.\n\n"
+        f"Адрес: {SALON_ADDRESS}\n"
+        f"Телефон: {SALON_PHONE}\n"
+        f"Часы работы: {SALON_WORKING_HOURS}\n\n"
+        f"Услуги:\n{prices}"
+    )
+
+
+def welcome_text(chat_id: int) -> str:
+    no_call = "включён" if get_no_call_pref(chat_id) else "выключен"
+    return (
+        f"Привет! Я бот салона {SALON_NAME}.\n\n"
+        "Что я умею:\n"
+        "• рассказать о салоне\n"
+        "• записать к мастеру\n"
+        "• показать и отменить запись\n"
+        "• включить режим ‘не звонить для подтверждения’\n"
+        "• прислать напоминания за 24 и 2 часа\n\n"
+        f"Текущий режим ‘не звонить’: {no_call}."
+    )
+
+
+def build_main_menu(chat_id: int):
+    no_call = get_no_call_pref(chat_id)
+    is_staff = chat_id in STAFF_CHAT_IDS
+
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        CallbackButton(text="ℹ️ О салоне", payload="about"),
+        CallbackButton(text="🗓 Записаться", payload="book"),
+    )
+    builder.row(
+        CallbackButton(text="📋 Мои записи", payload="my"),
+        CallbackButton(text="❌ Отменить запись", payload="cancel_menu"),
+    )
+    builder.row(
+        CallbackButton(
+            text=f"☎️ Не звонить: {'ВКЛ' if no_call else 'ВЫКЛ'}",
+            payload="toggle_no_call",
+        )
+    )
+    if is_staff:
+        builder.row(
+            CallbackButton(text="👩‍💼 Панель мастера", payload="admin"),
+        )
+    builder.row(
+        LinkButton(text="🌐 Сайт салона", url=SALON_SITE),
+    )
+    return builder.as_markup()
+
+
+def build_services_menu():
+    builder = InlineKeyboardBuilder()
+    for service_key, item in SERVICES.items():
+        builder.row(
+            CallbackButton(
+                text=f"{item['title']} · {item['price']}",
+                payload=f"svc|{service_key}",
             )
-        ])
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+    builder.row(CallbackButton(text="↩️ В меню", payload="back_main"))
+    return builder.as_markup()
 
-def get_masters_keyboard():
-    """Клавиатура с мастерами"""
-    masters = get_all_masters()
-    buttons = []
-    for master in masters:
-        buttons.append([
-            InlineKeyboardButton(
-                text=f"👨‍🔧 {master['name']} - {master['specialty']}",
-                callback_data=f"select_master_{master['id']}"
+
+def build_masters_menu(service_key: str):
+    builder = InlineKeyboardBuilder()
+    for master_key, title in MASTERS.items():
+        builder.row(
+            CallbackButton(
+                text=title,
+                payload=f"mst|{service_key}|{master_key}",
             )
-        ])
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+    builder.row(CallbackButton(text="↩️ В меню", payload="back_main"))
+    return builder.as_markup()
 
-def get_time_keyboard():
-    """Клавиатура с временем записи"""
-    now = datetime.now()
-    buttons = []
-    
-    # Генерируем слоты на следующие 7 дней
-    for day_offset in range(7):
-        date = now + timedelta(days=day_offset)
-        date_str = date.strftime("%d.%m")
-        
-        # Время с 10:00 до 20:00 с шагом 1 час
-        for hour in range(10, 21):
-            time_str = f"{hour:02d}:00"
-            datetime_str = date.strftime("%Y-%m-%d %H:%M")
-            buttons.append([
-                InlineKeyboardButton(
-                    text=f"🕐 {date_str} {time_str}",
-                    callback_data=f"select_time_{datetime_str}"
+
+def build_days_menu(service_key: str, master_key: str):
+    builder = InlineKeyboardBuilder()
+    today = now_local().date()
+    for offset in range(0, 7):
+        day = today + timedelta(days=offset)
+        label = day.strftime("%d.%m (%a)")
+        builder.row(
+            CallbackButton(
+                text=label,
+                payload=f"day|{service_key}|{master_key}|{day.isoformat()}",
+            )
+        )
+    builder.row(CallbackButton(text="↩️ В меню", payload="back_main"))
+    return builder.as_markup()
+
+
+def build_slots_menu(service_key: str, master_key: str, day_iso: str):
+    builder = InlineKeyboardBuilder()
+    day = datetime.fromisoformat(day_iso).date()
+
+    for slot in WORKING_SLOTS:
+        starts_at = datetime.fromisoformat(f"{day_iso}T{slot}:00").replace(tzinfo=TZ)
+        if starts_at <= now_local():
+            continue
+        starts_at_iso = starts_at.isoformat(timespec="minutes")
+        if slot_is_taken(master_key, starts_at_iso):
+            continue
+        builder.row(
+            CallbackButton(
+                text=f"{slot} · {master_title(master_key)}",
+                payload=f"slot|{service_key}|{master_key}|{starts_at_iso}",
+            )
+        )
+
+    builder.row(
+        CallbackButton(
+            text="↩️ Выбрать другой день",
+            payload=f"mst|{service_key}|{master_key}",
+        )
+    )
+    builder.row(CallbackButton(text="↩️ В меню", payload="back_main"))
+    return builder.as_markup()
+
+
+def build_cancel_menu(chat_id: int):
+    builder = InlineKeyboardBuilder()
+    rows = get_user_active_appointments(chat_id)
+
+    for row in rows:
+        builder.row(
+            CallbackButton(
+                text=f"❌ {service_title(row['service_key'])} · {format_dt_short(row['starts_at'])}",
+                payload=f"cancel|{row['id']}",
+            )
+        )
+
+    builder.row(CallbackButton(text="↩️ В меню", payload="back_main"))
+    return builder.as_markup()
+
+
+def build_admin_menu():
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        CallbackButton(text="📅 Записи на сегодня", payload="admin_today"),
+        CallbackButton(text="🗂 Все будущие", payload="admin_all"),
+    )
+    builder.row(CallbackButton(text="↩️ В меню", payload="back_main"))
+    return builder.as_markup()
+
+
+def format_client_appointments(chat_id: int) -> str:
+    rows = get_user_active_appointments(chat_id)
+    if not rows:
+        return "У вас пока нет активных записей. Нажмите “Записаться”, чтобы выбрать услугу и время."
+
+    chunks = ["Ваши активные записи:\n"]
+    for row in rows:
+        chunks.append(
+            "\n".join(
+                [
+                    f"№{row['id']} — {service_title(row['service_key'])}",
+                    f"Мастер: {master_title(row['master_key'])}",
+                    f"Когда: {format_dt(row['starts_at'])}",
+                    f"Подтверждение: {'не звонить' if row['no_call_confirm'] else 'можно звонить'}",
+                    "",
+                ]
+            )
+        )
+    return "\n".join(chunks).strip()
+
+
+def format_staff_rows(rows: list[sqlite3.Row]) -> str:
+    if not rows:
+        return "Список пуст."
+
+    parts: list[str] = []
+    for row in rows:
+        parts.append(
+            "\n".join(
+                [
+                    f"№{row['id']} · {format_dt(row['starts_at'])}",
+                    f"Клиент: {row['client_name']} · {row['phone']}",
+                    f"Услуга: {service_title(row['service_key'])}",
+                    f"Мастер: {master_title(row['master_key'])}",
+                    f"Статус: {'активна' if row['status'] == 'booked' else 'отменена'}",
+                    f"Подтверждение: {'не звонить' if row['no_call_confirm'] else 'можно звонить'}",
+                    "",
+                ]
+            )
+        )
+    return "\n".join(parts).strip()
+
+
+async def notify_staff(text: str) -> None:
+    for staff_chat_id in STAFF_CHAT_IDS:
+        try:
+            await bot.send_message(chat_id=staff_chat_id, text=text)
+        except Exception:
+            logger.exception("Не удалось отправить уведомление сотруднику %s", staff_chat_id)
+
+
+async def send_home(chat_id: int) -> None:
+    await bot.send_message(
+        chat_id=chat_id,
+        text=welcome_text(chat_id),
+        attachments=[build_main_menu(chat_id)],
+    )
+
+
+async def process_reminders() -> None:
+    rows = get_future_appointments()
+    now = now_local()
+
+    for row in rows:
+        if row["status"] != "booked":
+            continue
+
+        starts_at = parse_dt(row["starts_at"])
+        delta = starts_at - now
+
+        if timedelta(hours=23, minutes=55) <= delta <= timedelta(hours=24, minutes=5):
+            if not row["reminder24_sent"]:
+                await bot.send_message(
+                    chat_id=row["client_chat_id"],
+                    text=reminder_text(row, 24),
+                    attachments=[build_main_menu(row["client_chat_id"])],
                 )
-            ])
-    
-    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_services")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+                mark_reminder_sent(row["id"], 24)
 
-def get_confirmation_keyboard(appointment_id: int):
-    """Клавиатура подтверждения записи"""
-    buttons = [
-        [
-            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"confirm_app_{appointment_id}"),
-            InlineKeyboardButton(text="❌ Отменить", callback_data=f"cancel_app_{appointment_id}")
-        ],
-        [InlineKeyboardButton(text="📵 Не звоните для подтверждения", callback_data=f"dont_call_{appointment_id}")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+        if timedelta(hours=1, minutes=55) <= delta <= timedelta(hours=2, minutes=5):
+            if not row["reminder2_sent"]:
+                await bot.send_message(
+                    chat_id=row["client_chat_id"],
+                    text=reminder_text(row, 2),
+                    attachments=[build_main_menu(row["client_chat_id"])],
+                )
+                mark_reminder_sent(row["id"], 2)
 
-def get_my_appointments_keyboard():
-    """Клавиатура управления записями"""
-    buttons = [
-        [InlineKeyboardButton(text="📅 Активные", callback_data="active_appointments")],
-        [InlineKeyboardButton(text="❌ Отмененные", callback_data="cancelled_appointments")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_admin_keyboard():
-    """Админ панель"""
-    buttons = [
-        [InlineKeyboardButton(text="📋 Все записи", callback_data="admin_all")],
-        [InlineKeyboardButton(text="⏳ Ожидающие", callback_data="admin_pending")],
-        [InlineKeyboardButton(text="✅ Подтвержденные", callback_data="admin_confirmed")],
-        [InlineKeyboardButton(text="❌ Отмененные", callback_data="admin_cancelled")],
-        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
-        [InlineKeyboardButton(text="⬅️ Выход", callback_data="back_to_main")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-def get_appointment_action_keyboard(appointment_id: int):
-    """Клавиатура действий с записью"""
-    buttons = [
-        [
-            InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"admin_confirm_{appointment_id}"),
-            InlineKeyboardButton(text="❌ Отменить", callback_data=f"admin_cancel_{appointment_id}")
-        ],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_pending")]
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-# --- Обработчики сообщений ---
-
-@dp.message()
-async def start_command(event):
-    """Обработка команды /start"""
-    user = event.message.from_user
-    add_user(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name
-    )
-    
-    # Проверка на админа
-    if user.id in ADMIN_USER_IDS:
-        set_admin(user.id, True)
-    
-    welcome_text = (
-        f"👋 Привет, {user.first_name}!\n\n"
-        f"Добро пожаловать в салон красоты 'Beauty Salon'!\n\n"
-        f"Мы предлагаем:\n"
-        f"✨ Стрижки и укладки\n"
-        f"💅 Маникюр и педикюр\n"
-        f"🎨 Окрашивание волос\n"
-        f"💆‍♀️ Косметологические услуги\n\n"
-        f"📍 Наш адрес: ул. Красоты, д. 1\n"
-        f"📞 Телефон: +7 (999) 123-45-67\n"
-        f"⏰ Работаем ежедневно с 10:00 до 21:00\n\n"
-        f"Выберите действие в меню ниже:"
-    )
-    
-    await event.message.answer(
-        text=welcome_text,
-        attachments=[get_main_keyboard()]
-    )
-
-@dp.message()
-async def help_command(event):
-    """Обработка команды /help"""
-    help_text = (
-        "📚 Доступные команды:\n\n"
-        "/start - Начать работу с ботом\n"
-        "/menu - Показать главное меню\n"
-        "/myappointments - Мои записи\n"
-        "/cancel - Отменить последнюю запись\n"
-        "/admin - Админ панель (только для админов)\n\n"
-        "Нажмите на кнопки в меню для быстрого доступа!"
-    )
-    await event.message.answer(text=help_text, attachments=[get_main_keyboard()])
-
-@dp.message()
-async def menu_command(event):
-    """Обработка команды /menu"""
-    await event.message.answer(
-        text="Выберите действие:",
-        attachments=[get_main_keyboard()]
-    )
-
-# --- Обработчики callback-запросов ---
-
-@dp.message_callback()
-async def callback_main_menu(event: MessageCallback):
-    """Главное меню"""
-    user = event.message.from_user
-    welcome_text = (
-        f"👋 Привет, {user.first_name}!\n\n"
-        f"Выберите действие:"
-    )
-    await event.message.delete()
-    await event.message.answer(text=welcome_text, attachments=[get_main_keyboard()])
-
-@dp.message_callback()
-async def callback_book_appointment(event: MessageCallback):
-    """Начало записи"""
-    await event.message.delete()
-    await event.message.answer(
-        text="📅 Выберите услугу:",
-        attachments=[get_services_keyboard()]
-    )
-
-@dp.message_callback()
-async def callback_my_appointments(event: MessageCallback):
-    """Мои записи"""
-    await event.message.delete()
-    await event.message.answer(
-        text="📋 Выберите категорию:",
-        attachments=[get_my_appointments_keyboard()]
-    )
-
-@dp.message_callback()
-async def callback_about_salon(event: MessageCallback):
-    """О салоне"""
-    await event.message.delete()
-    about_text = (
-        "💇‍♀️ **Салон красоты 'Beauty Salon'**\n\n"
-        "Мы создаем красоту с 2015 года!\n\n"
-        "🏆 Наши преимущества:\n"
-        "• Профессиональные мастера\n"
-        "• Премиум косметика\n"
-        "• Уютная атмосфера\n"
-        "• Бесплатный кофе и Wi-Fi\n\n"
-        "📍 Адрес: ул. Красоты, д. 1\n"
-        "📞 Телефон: +7 (999) 123-45-67\n"
-        "🌐 Сайт: www.beautysalon.ru\n"
-        "⏰ Режим работы: 10:00 - 21:00 ежедневно\n\n"
-        "Ждем вас за красотой!"
-    )
-    await event.message.answer(text=about_text, attachments=[get_main_keyboard()])
-
-@dp.message_callback()
-async def callback_masters_list(event: MessageCallback):
-    """Список мастеров"""
-    await event.message.delete()
-    masters = get_all_masters()
-    if not masters:
-        text = "Пока нет информации о мастерах."
-    else:
-        text = "👨‍🔧 **Наши мастера:**\n\n"
-        for master in masters:
-            text += f"• {master['name']} - {master['specialty']}\n"
-    
-    await event.message.answer(text=text, attachments=[get_main_keyboard()])
-
-@dp.message_callback()
-async def callback_select_service(event: MessageCallback):
-    """Выбор услуги"""
-    service_id = int(event.data.split('_')[-1])
-    service = get_service(service_id)
-    
-    if not service:
-        await event.message.answer("Услуга не найдена.")
-        return
-    
-    await event.message.delete()
-    await event.message.answer(
-        text=f"💇‍♀️ **{service['name']}**\n\n"
-             f"Описание: {service['description']}\n"
-             f"Цена: {service['price']}₽\n"
-             f"Длительность: {service['duration']} мин\n\n"
-             f"Выберите мастера:",
-        attachments=[get_masters_keyboard()]
-    )
-
-@dp.message_callback()
-async def callback_select_master(event: MessageCallback):
-    """Выбор мастера"""
-    master_id = int(event.data.split('_')[-1])
-    master = get_master(master_id)
-    
-    if not master:
-        await event.message.answer("Мастер не найден.")
-        return
-    
-    await event.message.delete()
-    await event.message.answer(
-        text=f"👨‍🔧 **{master['name']}**\n\n"
-             f"Специализация: {master['specialty']}\n\n"
-             f"Выберите дату и время:",
-        attachments=[get_time_keyboard()]
-    )
-
-@dp.message_callback()
-async def callback_select_time(event: MessageCallback):
-    """Выбор времени"""
-    datetime_str = event.data.split('_')[-1]
-    try:
-        appointment_time = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M")
-    except ValueError:
-        await event.message.answer("Некорректное время.")
-        return
-    
-    # Получаем данные из предыдущих шагов (в реальном боте нужно хранить state)
-    # Для упрощения будем запрашивать услугу и мастера заново
-    await event.message.delete()
-    await event.message.answer(
-        text="Пожалуйста, начните запись заново, выбрав услугу и мастера.",
-        attachments=[get_main_keyboard()]
-    )
-
-@dp.message_callback()
-async def callback_active_appointments(event: MessageCallback):
-    """Активные записи"""
-    user_id = event.message.from_user.id
-    appointments = get_user_appointments(user_id, status='confirmed')
-    
-    await event.message.delete()
-    
-    if not appointments:
-        await event.message.answer(
-            text="У вас нет активных записей.",
-            attachments=[get_main_keyboard()]
-        )
-        return
-    
-    text = "📅 **Ваши активные записи:**\n\n"
-    for app in appointments:
-        text += (
-            f"• {app['service_name']} - {app['appointment_time'][:16].replace('T', ' ')}\n"
-            f"  Мастер: {app['master_name'] or 'Не назначен'}\n"
-            f"  Статус: {app['status']}\n\n"
-        )
-    
-    await event.message.answer(text=text, attachments=[get_main_keyboard()])
-
-@dp.message_callback()
-async def callback_cancelled_appointments(event: MessageCallback):
-    """Отмененные записи"""
-    user_id = event.message.from_user.id
-    appointments = get_user_appointments(user_id, status='cancelled')
-    
-    await event.message.delete()
-    
-    if not appointments:
-        await event.message.answer(
-            text="У вас нет отмененных записей.",
-            attachments=[get_main_keyboard()]
-        )
-        return
-    
-    text = "❌ **Ваши отмененные записи:**\n\n"
-    for app in appointments:
-        text += (
-            f"• {app['service_name']} - {app['appointment_time'][:16].replace('T', ' ')}\n"
-            f"  Мастер: {app['master_name'] or 'Не назначен'}\n\n"
-        )
-    
-    await event.message.answer(text=text, attachments=[get_main_keyboard()])
-
-@dp.message_callback()
-async def callback_admin_panel(event: MessageCallback):
-    """Админ панель"""
-    user_id = event.message.from_user.id
-    if user_id not in ADMIN_USER_IDS:
-        await event.message.answer("Доступ запрещен.")
-        return
-    
-    await event.message.delete()
-    await event.message.answer(
-        text="🔧 **Админ панель**\n\nВыберите действие:",
-        attachments=[get_admin_keyboard()]
-    )
-
-@dp.message_callback()
-async def callback_admin_all(event: MessageCallback):
-    """Все записи"""
-    appointments = get_all_appointments()
-    
-    await event.message.delete()
-    
-    if not appointments:
-        await event.message.answer("Записей нет.")
-        return
-    
-    text = "📋 **Все записи:**\n\n"
-    for app in appointments[:10]:  # Ограничим 10 записями
-        text += (
-            f"• {app['first_name']} {app['last_name']}\n"
-            f"  {app['service_name']} - {app['appointment_time'][:16].replace('T', ' ')}\n"
-            f"  Статус: {app['status']}\n\n"
-        )
-    
-    if len(appointments) > 10:
-        text += f"\n... и еще {len(appointments) - 10} записей"
-    
-    await event.message.answer(text=text, attachments=[get_admin_keyboard()])
-
-@dp.message_callback()
-async def callback_admin_pending(event: MessageCallback):
-    """Ожидающие записи"""
-    appointments = get_pending_appointments()
-    
-    await event.message.delete()
-    
-    if not appointments:
-        await event.message.answer("Нет ожидающих записей.")
-        return
-    
-    text = "⏳ **Ожидающие подтверждения записи:**\n\n"
-    for app in appointments:
-        text += (
-            f"📝 Запись #{app['id']}\n"
-            f"  {app['first_name']} {app['last_name']}\n"
-            f"  {app['service_name']} - {app['appointment_time'][:16].replace('T', ' ')}\n"
-            f"  Телефон: {app['phone'] or 'Не указан'}\n\n"
-        )
-    
-    await event.message.answer(text=text, attachments=[get_admin_keyboard()])
-
-@dp.message_callback()
-async def callback_admin_confirmed(event: MessageCallback):
-    """Подтвержденные записи"""
-    appointments = get_confirmed_appointments()
-    
-    await event.message.delete()
-    
-    if not appointments:
-        await event.message.answer("Нет подтвержденных записей.")
-        return
-    
-    text = "✅ **Подтвержденные записи:**\n\n"
-    for app in appointments[:10]:
-        text += (
-            f"• {app['first_name']} {app['last_name']}\n"
-            f"  {app['service_name']} - {app['appointment_time'][:16].replace('T', ' ')}\n"
-            f"  Статус: {app['status']}\n\n"
-        )
-    
-    await event.message.answer(text=text, attachments=[get_admin_keyboard()])
-
-@dp.message_callback()
-async def callback_admin_cancelled(event: MessageCallback):
-    """Отмененные записи (админ)"""
-    appointments = get_cancelled_appointments()
-    
-    await event.message.delete()
-    
-    if not appointments:
-        await event.message.answer("Нет отмененных записей.")
-        return
-    
-    text = "❌ **Отмененные записи:**\n\n"
-    for app in appointments[:10]:
-        text += (
-            f"• {app['first_name']} {app['last_name']}\n"
-            f"  {app['service_name']} - {app['appointment_time'][:16].replace('T', ' ')}\n\n"
-        )
-    
-    await event.message.answer(text=text, attachments=[get_admin_keyboard()])
-
-@dp.message_callback()
-async def callback_admin_users(event: MessageCallback):
-    """Пользователи (админ)"""
-    users = get_all_users()
-    
-    await event.message.delete()
-    
-    if not users:
-        await event.message.answer("Пользователей нет.")
-        return
-    
-    text = "👥 **Пользователи:**\n\n"
-    for user in users[:20]:
-        admin_flag = "👑" if user['is_admin'] else ""
-        text += (
-            f"{admin_flag} {user['first_name']} {user['last_name'] or ''}\n"
-            f"  ID: {user['user_id']}\n"
-            f"  Телефон: {user['phone'] or 'Не указан'}\n\n"
-        )
-    
-    await event.message.answer(text=text, attachments=[get_admin_keyboard()])
-
-# --- Команды ---
-
-@dp.message()
-async def admin_command(event):
-    """Команда /admin"""
-    user_id = event.message.from_user.id
-    if user_id not in ADMIN_USER_IDS:
-        await event.message.answer("Доступ запрещен.")
-        return
-    
-    await event.message.answer(
-        text="🔧 **Админ панель**",
-        attachments=[get_admin_keyboard()]
-    )
-
-@dp.message()
-async def cancel_command(event):
-    """Команда /cancel - отмена последней записи"""
-    user_id = event.message.from_user.id
-    appointments = get_user_appointments(user_id, status='confirmed')
-    
-    if not appointments:
-        await event.message.answer("У вас нет активных записей для отмены.")
-        return
-    
-    last_app = appointments[0]
-    update_appointment_status(last_app['id'], 'cancelled')
-    
-    await event.message.answer(
-        text=f"❌ Ваша запись отменена!\n\n"
-             f"Услуга: {last_app['service_name']}\n"
-             f"Дата: {last_app['appointment_time'][:16].replace('T', ' ')}"
-    )
-
-# --- Фоновые задачи для уведомлений ---
-
-async def send_notifications():
-    """Фоновая задача для отправки уведомлений"""
+async def reminders_worker() -> None:
     while True:
         try:
-            # Уведомления за 24 часа
-            appointments_24h = get_appointments_needing_notification(24)
-            for app in appointments_24h:
-                # Проверяем, не отправлено ли уже уведомление
-                history = get_notification_history(app['id'])
-                if any(n['notification_type'] == '24h' and n['is_sent'] for n in history):
-                    continue
-                
-                # Отправляем уведомление
-                message = (
-                    f"⏰ Напоминание о записи!\n\n"
-                    f"Завтра у вас запись:\n"
-                    f"Услуга: {app['service_name']}\n"
-                    f"Время: {app['appointment_time'][:16].replace('T', ' ')}\n"
-                    f"Мастер: {app['master_name'] or 'Не назначен'}\n\n"
-                    f"Если вам нужно отменить, напишите нам."
-                )
-                
-                # Здесь нужно отправить сообщение пользователю через бота
-                # await bot.send_message(chat_id=app['user_id'], text=message)
-                add_notification(app['id'], '24h')
-            
-            # Уведомления за 2 часа
-            appointments_2h = get_appointments_needing_notification(2)
-            for app in appointments_2h:
-                history = get_notification_history(app['id'])
-                if any(n['notification_type'] == '2h' and n['is_sent'] for n in history):
-                    continue
-                
-                message = (
-                    f"🔔 Напоминание о записи!\n\n"
-                    f"Через 2 часа у вас запись:\n"
-                    f"Услуга: {app['service_name']}\n"
-                    f"Время: {app['appointment_time'][:16].replace('T', ' ')}\n"
-                    f"Мастер: {app['master_name'] or 'Не назначен'}\n\n"
-                    f"До встречи!"
-                )
-                
-                # await bot.send_message(chat_id=app['user_id'], text=message)
-                add_notification(app['id'], '2h')
-            
-            await asyncio.sleep(3600)  # Проверка каждый час
-        except Exception as e:
-            logger.error(f"Ошибка при отправке уведомлений: {e}")
-            await asyncio.sleep(3600)
+            await process_reminders()
+        except Exception:
+            logger.exception("Ошибка фоновой задачи reminders_worker")
+        await asyncio.sleep(60)
 
-# --- Запуск бота ---
 
-async def main():
-    """Основная функция запуска"""
-    logger.info("Запуск бота салона красоты...")
-    
-    # Инициализация базы данных
+@dp.bot_started()
+async def on_bot_started(event: BotStarted):
+    await bot.send_message(
+        chat_id=event.chat_id,
+        text=f"Привет! Я бот салона {SALON_NAME}. Отправь /start, чтобы открыть меню.",
+    )
+
+
+@dp.message_created(F.message.body.text)
+async def on_text(event: MessageCreated):
+    chat_id = event.chat_id
+    text = event.message.body.text.strip()
+    normalized = text.lower()
+    state, data = get_state(chat_id)
+
+    if normalized in {"/start", "start", "/menu", "menu", "меню"}:
+        clear_state(chat_id)
+        await send_home(chat_id)
+        return
+
+    if normalized in {"/help", "help", "помощь"}:
+        await event.message.answer(
+            text=(
+                "Команды и сценарии:\n"
+                "/start — главное меню\n"
+                "/menu — снова показать меню\n"
+                "/my — мои записи\n"
+                "/admin — панель мастера (только для сотрудников)\n\n"
+                "Также можно нажимать кнопки в меню."
+            ),
+            attachments=[build_main_menu(chat_id)],
+        )
+        return
+
+    if normalized in {"/my", "мои записи"}:
+        await event.message.answer(
+            text=format_client_appointments(chat_id),
+            attachments=[build_main_menu(chat_id)],
+        )
+        return
+
+    if normalized in {"/admin"} and chat_id in STAFF_CHAT_IDS:
+        await event.message.answer(
+            text="Панель мастера открыта.",
+            attachments=[build_admin_menu()],
+        )
+        return
+
+    if normalized in {"сброс", "отмена диалога", "/cancel_flow"}:
+        clear_state(chat_id)
+        await event.message.answer(
+            text="Черновик записи очищен. Можно начать заново.",
+            attachments=[build_main_menu(chat_id)],
+        )
+        return
+
+    if state == "await_name":
+        data["client_name"] = text
+        set_state(chat_id, "await_phone", data)
+        await event.message.answer(
+            text="Отлично. Теперь отправьте телефон для связи, например: +79990000000",
+            attachments=[build_main_menu(chat_id)],
+        )
+        return
+
+    if state == "await_phone":
+        appointment = create_appointment(
+            client_chat_id=chat_id,
+            client_user_id=getattr(event, "user_id", None),
+            client_name=data["client_name"],
+            phone=text,
+            service_key=data["service_key"],
+            master_key=data["master_key"],
+            starts_at=data["starts_at"],
+            no_call_confirm=get_no_call_pref(chat_id),
+        )
+        clear_state(chat_id)
+
+        await event.message.answer(
+            text=(
+                "Готово, вы записаны!\n\n"
+                f"{appointment_text(appointment, include_client=False)}\n\n"
+                f"Салон: {SALON_NAME}\n"
+                f"Адрес: {SALON_ADDRESS}"
+            ),
+            attachments=[build_main_menu(chat_id)],
+        )
+
+        await notify_staff(
+            "Новая запись в салон!\n\n"
+            f"{appointment_text(appointment, include_client=True)}"
+        )
+        return
+
+    await event.message.answer(
+        text=(
+            "Я помогу записаться в салон красоты. Нажмите кнопку “Записаться”, “Мои записи” или “О салоне”."
+        ),
+        attachments=[build_main_menu(chat_id)],
+    )
+
+
+@dp.message_callback()
+async def on_callback(event: MessageCallback):
+    chat_id = event.chat_id
+    payload = event.callback.payload or ""
+
+    if payload == "about":
+        await event.message.answer(
+            text=about_text(),
+            attachments=[build_main_menu(chat_id)],
+        )
+        return
+
+    if payload == "book":
+        clear_state(chat_id)
+        await event.message.answer(
+            text="Выберите услугу:",
+            attachments=[build_services_menu()],
+        )
+        return
+
+    if payload == "my":
+        await event.message.answer(
+            text=format_client_appointments(chat_id),
+            attachments=[build_main_menu(chat_id)],
+        )
+        return
+
+    if payload == "cancel_menu":
+        rows = get_user_active_appointments(chat_id)
+        if not rows:
+            await event.message.answer(
+                text="У вас нет активных записей для отмены.",
+                attachments=[build_main_menu(chat_id)],
+            )
+            return
+
+        await event.message.answer(
+            text="Выберите запись, которую хотите отменить:",
+            attachments=[build_cancel_menu(chat_id)],
+        )
+        return
+
+    if payload == "toggle_no_call":
+        enabled = toggle_no_call_pref(chat_id)
+        await event.message.answer(
+            text=(
+                "Настройка обновлена.\n\n"
+                f"Режим ‘не звонить для подтверждения’: {'включён' if enabled else 'выключен'}."
+            ),
+            attachments=[build_main_menu(chat_id)],
+        )
+        return
+
+    if payload == "admin":
+        if chat_id not in STAFF_CHAT_IDS:
+            await event.message.answer(
+                text="Эта панель доступна только сотрудникам салона.",
+                attachments=[build_main_menu(chat_id)],
+            )
+            return
+
+        await event.message.answer(
+            text="Панель мастера:",
+            attachments=[build_admin_menu()],
+        )
+        return
+
+    if payload == "admin_today":
+        if chat_id not in STAFF_CHAT_IDS:
+            await event.message.answer(text="Нет доступа.")
+            return
+
+        await event.message.answer(
+            text="Записи на сегодня:\n\n" + format_staff_rows(get_today_appointments()),
+            attachments=[build_admin_menu()],
+        )
+        return
+
+    if payload == "admin_all":
+        if chat_id not in STAFF_CHAT_IDS:
+            await event.message.answer(text="Нет доступа.")
+            return
+
+        await event.message.answer(
+            text="Все будущие записи:\n\n" + format_staff_rows(get_future_appointments()),
+            attachments=[build_admin_menu()],
+        )
+        return
+
+    if payload == "back_main":
+        clear_state(chat_id)
+        await event.message.answer(
+            text=welcome_text(chat_id),
+            attachments=[build_main_menu(chat_id)],
+        )
+        return
+
+    if payload.startswith("svc|"):
+        _, service_key = payload.split("|", 1)
+        await event.message.answer(
+            text=(
+                f"Услуга: {service_title(service_key)}\n"
+                f"Стоимость: {service_price(service_key)}\n\n"
+                "Выберите мастера:"
+            ),
+            attachments=[build_masters_menu(service_key)],
+        )
+        return
+
+    if payload.startswith("mst|"):
+        _, service_key, master_key = payload.split("|", 2)
+        await event.message.answer(
+            text=(
+                f"Услуга: {service_title(service_key)}\n"
+                f"Мастер: {master_title(master_key)}\n\n"
+                "Выберите день визита:"
+            ),
+            attachments=[build_days_menu(service_key, master_key)],
+        )
+        return
+
+    if payload.startswith("day|"):
+        _, service_key, master_key, day_iso = payload.split("|", 3)
+        await event.message.answer(
+            text=(
+                f"Свободные слоты на {day_iso} для мастера {master_title(master_key)}:\n"
+                "Выберите время:"
+            ),
+            attachments=[build_slots_menu(service_key, master_key, day_iso)],
+        )
+        return
+
+    if payload.startswith("slot|"):
+        _, service_key, master_key, starts_at = payload.split("|", 3)
+
+        if slot_is_taken(master_key, starts_at):
+            await event.message.answer(
+                text="Этот слот уже заняли. Пожалуйста, выберите другое время.",
+                attachments=[build_days_menu(service_key, master_key)],
+            )
+            return
+
+        set_state(
+            chat_id,
+            "await_name",
+            {
+                "service_key": service_key,
+                "master_key": master_key,
+                "starts_at": starts_at,
+            },
+        )
+        await event.message.answer(
+            text=(
+                f"Отлично. Вы выбрали {service_title(service_key)} к мастеру {master_title(master_key)}"
+                f" на {format_dt(starts_at)}.\n\n"
+                "Теперь напишите ваше имя и фамилию."
+            ),
+            attachments=[build_main_menu(chat_id)],
+        )
+        return
+
+    if payload.startswith("cancel|"):
+        _, appointment_id_str = payload.split("|", 1)
+        appointment_id = int(appointment_id_str)
+        appointment = get_appointment(appointment_id)
+
+        if not appointment:
+            await event.message.answer(
+                text="Запись не найдена.",
+                attachments=[build_main_menu(chat_id)],
+            )
+            return
+
+        is_owner = appointment["client_chat_id"] == chat_id
+        is_staff = chat_id in STAFF_CHAT_IDS
+
+        if not is_owner and not is_staff:
+            await event.message.answer(
+                text="Вы не можете отменить эту запись.",
+                attachments=[build_main_menu(chat_id)],
+            )
+            return
+
+        cancelled = cancel_appointment(appointment_id)
+        if not cancelled:
+            await event.message.answer(
+                text="Эта запись уже отменена или недоступна.",
+                attachments=[build_main_menu(chat_id)],
+            )
+            return
+
+        await event.message.answer(
+            text=(
+                "Запись отменена.\n\n"
+                f"{appointment_text(cancelled, include_client=False)}"
+            ),
+            attachments=[build_main_menu(chat_id)],
+        )
+
+        await notify_staff(
+            "Запись отменена!\n\n"
+            f"{appointment_text(cancelled, include_client=True)}"
+        )
+        return
+
+    await event.message.answer(
+        text="Неизвестное действие. Вернул вас в главное меню.",
+        attachments=[build_main_menu(chat_id)],
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global reminder_task
     init_db()
-    logger.info("База данных инициализирована")
-    
-    # Установка команд бота
+
+    async with webhook.lifespan(app):
+        reminder_task = asyncio.create_task(reminders_worker())
+        logger.info("Beauty salon bot is running")
+        try:
+            yield
+        finally:
+            if reminder_task:
+                reminder_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await reminder_task
+
+
+app = FastAPI(title="MAX Beauty Salon Bot", lifespan=lifespan)
+
+
+@app.get("/")
+async def root():
+    return {
+        "ok": True,
+        "service": "max-beauty-salon-bot",
+        "webhook": "/webhook",
+        "health": "/health",
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "db": DB_PATH}
+
+
+webhook.setup(app, path="/webhook")
+
+
+async def main() -> None:
+    init_db()
+
+    if os.getenv("MAX_WEBHOOK_URL"):
+        logger.info("Обнаружен MAX_WEBHOOK_URL. Для webhook запускайте: uvicorn main:app --host 0.0.0.0 --port 8080")
+        return
+
+    await bot.delete_webhook()
+    logger.info("Запуск в режиме polling для локального тестирования")
+
+    global reminder_task
+    reminder_task = asyncio.create_task(reminders_worker())
     try:
-        await bot.set_my_commands([
-            {"command": "start", "description": "Начать работу"},
-            {"command": "menu", "description": "Главное меню"},
-            {"command": "myappointments", "description": "Мои записи"},
-            {"command": "cancel", "description": "Отменить запись"},
-            {"command": "admin", "description": "Админ панель"},
-            {"command": "help", "description": "Помощь"}
-        ])
-        logger.info("Команды бота установлены")
-    except Exception as e:
-        logger.error(f"Не удалось установить команды бота: {e}")
-    
-    # Запуск фоновой задачи уведомлений
-    notification_task = asyncio.create_task(send_notifications())
-    
-    # Запуск бота
-    if WEBHOOK_URL:
-        logger.info(f"Запуск через webhook: {WEBHOOK_URL}")
-        await dp.start_webhook(webhook_path="/webhook", webhook_url=WEBHOOK_URL)
-    else:
-        logger.info("Запуск в режиме polling")
-        await dp.start_polling()
-    
-    notification_task.cancel()
+        await dp.start_polling(bot)
+    finally:
+        if reminder_task:
+            reminder_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await reminder_task
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен")
+    asyncio.run(main())
