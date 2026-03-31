@@ -49,7 +49,7 @@ from database import (
     get_appointments_for_notification,
     add_notification_log,
     is_admin,
-    is_notification_sent,
+    get_notification_history,
 )
 
 # Настройка логирования
@@ -831,7 +831,8 @@ async def send_notifications():
             continue
         
         # Проверяем, не отправлено ли уже уведомление
-        if is_notification_sent(appt['id'], "reminder_24h"):
+        history = get_notification_history(appt['id'])
+        if any(n['notification_type'] == 'reminder_24h' and n['is_sent'] == 1 for n in history):
             continue
         
         try:
@@ -855,7 +856,8 @@ async def send_notifications():
             continue
         
         # Проверяем, не отправлено ли уже уведомление
-        if is_notification_sent(appt['id'], "reminder_2h"):
+        history = get_notification_history(appt['id'])
+        if any(n['notification_type'] == 'reminder_2h' and n['is_sent'] == 1 for n in history):
             continue
         
         try:
