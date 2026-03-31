@@ -368,7 +368,7 @@ def get_notification_history(appointment_id: int) -> List[Dict[str, Any]]:
         )
         return [dict(row) for row in cursor.fetchall()]
 
-# --- Вспомогательные функции ---
+# --- Вспомогательные функции для совместимости с main.py ---
 
 def add_service(id: int, name: str, price: float, duration: int):
     """Добавить услугу"""
@@ -475,10 +475,6 @@ def mark_no_call(appointment_id: int):
         cursor = conn.cursor()
         cursor.execute("UPDATE appointments SET status = 'confirmed', dont_call = 1 WHERE id = ?", (appointment_id,))
         conn.commit()
-
-def get_pending_appointments() -> List[Dict[str, Any]]:
-    """Получить все ожидающие записи"""
-    return get_appointments(status='pending')
 
 def get_appointments_for_notification(hours: int) -> List[Dict[str, Any]]:
     """Получить записи для уведомления за N часов"""
