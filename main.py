@@ -49,6 +49,7 @@ from database import (
     get_appointments_for_notification,
     add_notification_log,
     is_admin,
+    is_notification_sent,
 )
 
 # Настройка логирования
@@ -144,9 +145,6 @@ def get_time_keyboard(service_id: int, master_id: int) -> InlineKeyboardBuilder:
     builder = InlineKeyboardBuilder()
     
     # Генерируем слоты времени на сегодня и завтра
-    today = datetime.now()
-    tomorrow = today + timedelta(days=1)
-    
     time_slots = ["10:00", "11:00", "12:00", "14:00", "15:00", "16:00", "17:00", "18:00"]
     
     for slot in time_slots:
@@ -228,7 +226,7 @@ async def bot_started(event: BotStarted):
     # Добавляем пользователя в базу данных
     add_user(event.chat_id, event.from_user.first_name, event.from_user.last_name or "")
     
-    await event.bot.send_message(
+    await bot.send_message(
         chat_id=event.chat_id,
         text="👋 Привет! Добро пожаловать в салон красоты!\n\n"
              "Я помогу вам записаться на любую услугу.\n\n"
@@ -315,7 +313,7 @@ async def cmd_masters(event: MessageCreated):
     
     text = "👥 **Наши мастера:**\n\n"
     for master in masters:
-        text += f"• {master['name']} - {master['specialization']}\n"
+        text += f"• {master['name']} - {master['specialty']}\n"
     
     await event.message.answer(
         text=text,
@@ -403,7 +401,7 @@ async def menu_masters(event: MessageCallback):
     
     text = "👥 **Наши мастера:**\n\n"
     for master in masters:
-        text += f"• {master['name']} - {master['specialization']}\n"
+        text += f"• {master['name']} - {master['specialty']}\n"
     
     await event.message.answer(
         text=text,
@@ -607,7 +605,6 @@ async def back_to_services(event: MessageCallback):
 async def back_to_masters(event: MessageCallback):
     """Возврат к списку мастеров"""
     await event.message.delete()
-    # Получаем service_id из последнего callback
     # Для простоты, возвращаем к услугам
     await event.message.answer(
         text="📅 **Выберите услугу:**\n\n"
@@ -746,6 +743,7 @@ async def admin_all(event: MessageCallback):
 @dp.message_callback(F.callback.payload.startswith("admin_confirm_"))
 async def admin_confirm_appointment(event: MessageCallback):
     """Подтверждение записи администратором"""
+    # Извлекаем appointment_id правильно: payload = "admin_confirm_123"
     appointment_id = int(event.callback.payload.split("_")[2])
     appointment = get_appointment_by_id(appointment_id)
     
@@ -784,6 +782,7 @@ async def admin_confirm_appointment(event: MessageCallback):
 @dp.message_callback(F.callback.payload.startswith("admin_cancel_"))
 async def admin_cancel_appointment(event: MessageCallback):
     """Отмена записи администратором"""
+    # Извлекаем appointment_id правильно: payload = "admin_cancel_123"
     appointment_id = int(event.callback.payload.split("_")[2])
     appointment = get_appointment_by_id(appointment_id)
     
@@ -832,7 +831,8 @@ async def send_notifications():
             continue
         
         # Проверяем, не отправлено ли уже уведомление
-        # В реальном проекте нужно проверять таблицу notifications
+        if is_notification_sent(appt['id'], "reminder_24h"):
+            continue
         
         try:
             await bot.send_message(
@@ -855,6 +855,8 @@ async def send_notifications():
             continue
         
         # Проверяем, не отправлено ли уже уведомление
+        if is_notification_sent(appt['id'], "reminder_2h"):
+            continue
         
         try:
             await bot.send_message(
@@ -892,12 +894,14 @@ async def main():
     # Установка команд бота
     try:
         await bot.set_my_commands(
-            BotCommand(name='/start', description='Начать работу с ботом'),
-            BotCommand(name='/menu', description='Показать главное меню'),
-            BotCommand(name='/my_appointments', description='Мои записи'),
-            BotCommand(name='/about', description='О салоне'),
-            BotCommand(name='/masters', description='Наши мастера'),
-            BotCommand(name='/admin', description='Админ панель'),
+            [
+                BotCommand(name='/start', description='Начать работу с ботом'),
+                BotCommand(name='/menu', description='Показать главное меню'),
+                BotCommand(name='/my_appointments', description='Мои записи'),
+                BotCommand(name='/about', description='О салоне'),
+                BotCommand(name='/masters', description='Наши мастера'),
+                BotCommand(name='/admin', description='Админ панель'),
+            ]
         )
     except Exception as e:
         logger.error(f"Не удалось установить команды бота: {e}")
