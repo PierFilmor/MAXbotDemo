@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 from dotenv import load_dotenv
 
-from maxapi import Bot, Dispatcher, F
+from maxapi import Bot, Dispatcher
 from maxapi.types import (
     BotStarted,
     Command,
@@ -27,8 +27,26 @@ from maxapi.types import (
     BotCommand,
 )
 from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
-from maxapi.enums.parse_mode import ParseMode
 
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Загрузка переменных окружения
+load_dotenv()
+
+# Инициализация бота и диспетчера
+bot = Bot()
+dp = Dispatcher()
+
+# Глобальные переменные для администраторов
+ADMIN_USER_IDS = os.getenv('ADMIN_USER_IDS', '').split(',')
+ADMIN_USER_IDS = [int(id.strip()) for id in ADMIN_USER_IDS if id.strip().isdigit()]
+
+# Импорты из database
 from database import (
     init_db,
     add_user,
@@ -51,24 +69,6 @@ from database import (
     is_admin,
     get_notification_history,
 )
-
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Загрузка переменных окружения
-load_dotenv()
-
-# Инициализация бота и диспетчера
-bot = Bot()
-dp = Dispatcher()
-
-# Глобальные переменные для администраторов
-ADMIN_USER_IDS = os.getenv('ADMIN_USER_IDS', '').split(',')
-ADMIN_USER_IDS = [int(id.strip()) for id in ADMIN_USER_IDS if id.strip().isdigit()]
 
 # Инициализация базы данных
 init_db()
@@ -144,10 +144,6 @@ def get_time_keyboard(service_id: int, master_id: int) -> InlineKeyboardBuilder:
     """Меню выбора времени"""
     builder = InlineKeyboardBuilder()
     
-    # Генерируем слоты времени на сегодня и завтра
-    today = datetime.now()
-    tomorrow = today + timedelta(days=1)
-    
     time_slots = ["10:00", "11:00", "12:00", "14:00", "15:00", "16:00", "17:00", "18:00"]
     
     for slot in time_slots:
@@ -187,7 +183,7 @@ def get_my_appointments_keyboard(user_id: int) -> InlineKeyboardBuilder:
         status_emoji = "⏳" if appt['status'] == 'pending' else "✅" if appt['status'] == 'confirmed' else "❌"
         builder.row(
             CallbackButton(
-                text=f"{status_emoji} #{appt['id']} - {appt['service_name']} ({appt['datetime']})",
+                text=f"{status_emoji} #{appt['id']} - {appt['service_name']} ({appt['appointment_time']})",
                 payload=f"view_appointment_{appt['id']}"
             )
         )
@@ -227,7 +223,7 @@ async def bot_started(event: BotStarted):
     logger.info(f"Бот запущен для пользователя {event.chat_id}")
     
     # Добавляем пользователя в базу данных
-    add_user(event.chat_id, event.from_user.first_name, event.from_user.last_name or "")
+    add_user(event.chat_id, event.from_user.username, event.from_user.first_name or "", event.from_user.last_name or "")
     
     await event.bot.send_message(
         chat_id=event.chat_id,
@@ -247,7 +243,7 @@ async def cmd_start(event: MessageCreated):
     user_id = event.chat_id
     
     # Добавляем пользователя в базу данных
-    add_user(user_id, event.from_user.first_name, event.from_user.last_name or "")
+    add_user(user_id, event.from_user.username, event.from_user.first_name or "", event.from_user.last_name or "")
     
     await event.message.answer(
         text="👋 Привет! Добро пожаловать в салон красоты!\n\n"
@@ -284,7 +280,7 @@ async def cmd_my_appointments(event: MessageCreated):
         status_emoji = "⏳" if appt['status'] == 'pending' else "✅" if appt['status'] == 'confirmed' else "❌"
         text += f"{status_emoji} #{appt['id']} - {appt['service_name']}\n"
         text += f"   Мастер: {appt['master_name']}\n"
-        text += f"   Время: {appt['datetime']}\n"
+        text += f"   Время: {appt['appointment_time']}\n"
         text += f"   Статус: {appt['status']}\n\n"
     
     await event.message.answer(
@@ -340,7 +336,7 @@ async def cmd_admin(event: MessageCreated):
 
 # ==================== ОБРАБОТЧИКИ CALLBACK ====================
 
-@dp.message_callback(F.callback.payload == "menu_book")
+@dp.message_callback(lambda c: c.payload == "menu_book")
 async def menu_book(event: MessageCallback):
     """Переход к записи"""
     await event.message.delete()
@@ -350,7 +346,7 @@ async def menu_book(event: MessageCallback):
         attachments=[get_services_keyboard().as_markup()]
     )
 
-@dp.message_callback(F.callback.payload == "menu_my_appointments")
+@dp.message_callback(lambda c: c.payload == "menu_my_appointments")
 async def menu_my_appointments(event: MessageCallback):
     """Показать записи пользователя"""
     await event.message.delete()
@@ -370,7 +366,7 @@ async def menu_my_appointments(event: MessageCallback):
         status_emoji = "⏳" if appt['status'] == 'pending' else "✅" if appt['status'] == 'confirmed' else "❌"
         text += f"{status_emoji} #{appt['id']} - {appt['service_name']}\n"
         text += f"   Мастер: {appt['master_name']}\n"
-        text += f"   Время: {appt['datetime']}\n"
+        text += f"   Время: {appt['appointment_time']}\n"
         text += f"   Статус: {appt['status']}\n\n"
     
     await event.message.answer(
@@ -378,7 +374,7 @@ async def menu_my_appointments(event: MessageCallback):
         attachments=[get_my_appointments_keyboard(user_id).as_markup()]
     )
 
-@dp.message_callback(F.callback.payload == "menu_about")
+@dp.message_callback(lambda c: c.payload == "menu_about")
 async def menu_about(event: MessageCallback):
     """Информация о салоне"""
     await event.message.delete()
@@ -396,7 +392,7 @@ async def menu_about(event: MessageCallback):
         attachments=[get_main_menu_keyboard().as_markup()]
     )
 
-@dp.message_callback(F.callback.payload == "menu_masters")
+@dp.message_callback(lambda c: c.payload == "menu_masters")
 async def menu_masters(event: MessageCallback):
     """Информация о мастерах"""
     await event.message.delete()
@@ -411,7 +407,7 @@ async def menu_masters(event: MessageCallback):
         attachments=[get_main_menu_keyboard().as_markup()]
     )
 
-@dp.message_callback(F.callback.payload.startswith("service_"))
+@dp.message_callback(lambda c: c.payload.startswith("service_"))
 async def select_service(event: MessageCallback):
     """Выбор услуги"""
     service_id = int(event.callback.payload.split("_")[1])
@@ -423,7 +419,7 @@ async def select_service(event: MessageCallback):
         attachments=[get_masters_keyboard(service_id).as_markup()]
     )
 
-@dp.message_callback(F.callback.payload.startswith("master_"))
+@dp.message_callback(lambda c: c.payload.startswith("master_"))
 async def select_master(event: MessageCallback):
     """Выбор мастера"""
     parts = event.callback.payload.split("_")
@@ -438,7 +434,7 @@ async def select_master(event: MessageCallback):
         attachments=[get_time_keyboard(service_id, master_id).as_markup()]
     )
 
-@dp.message_callback(F.callback.payload.startswith("time_"))
+@dp.message_callback(lambda c: c.payload.startswith("time_"))
 async def select_time(event: MessageCallback):
     """Выбор времени и создание записи"""
     parts = event.callback.payload.split("_")
@@ -464,7 +460,7 @@ async def select_time(event: MessageCallback):
         user_id=user_id,
         service_id=service_id,
         master_id=master_id,
-        datetime=f"{datetime.now().strftime('%Y-%m-%d')} {time_slot}",
+        datetime_str=f"{datetime.now().strftime('%Y-%m-%d')} {time_slot}",
         status="pending"
     )
     
@@ -495,7 +491,7 @@ async def select_time(event: MessageCallback):
         except Exception as e:
             logger.error(f"Ошибка отправки уведомления администратору {admin_id}: {e}")
 
-@dp.message_callback(F.callback.payload.startswith("confirm_"))
+@dp.message_callback(lambda c: c.payload.startswith("confirm_"))
 async def confirm_appointment(event: MessageCallback):
     """Подтверждение записи клиентом"""
     appointment_id = int(event.callback.payload.split("_")[1])
@@ -518,7 +514,7 @@ async def confirm_appointment(event: MessageCallback):
     # Логирование уведомления
     add_notification_log(appointment_id, "confirmed_by_client")
 
-@dp.message_callback(F.callback.payload.startswith("cancel_"))
+@dp.message_callback(lambda c: c.payload.startswith("cancel_"))
 async def cancel_appointment_client(event: MessageCallback):
     """Отмена записи клиентом"""
     appointment_id = int(event.callback.payload.split("_")[1])
@@ -549,7 +545,7 @@ async def cancel_appointment_client(event: MessageCallback):
                 text=f"❌ **Запись отменена**\n\n"
                      f"Клиент: {appointment['user_name']}\n"
                      f"Услуга: {appointment['service_name']}\n"
-                     f"Время: {appointment['datetime']}\n\n"
+                     f"Время: {appointment['appointment_time']}\n\n"
                      f"ID записи: {appointment_id}",
                 attachments=[get_main_menu_keyboard().as_markup()]
             )
@@ -559,7 +555,7 @@ async def cancel_appointment_client(event: MessageCallback):
     # Логирование уведомления
     add_notification_log(appointment_id, "cancelled_by_client")
 
-@dp.message_callback(F.callback.payload.startswith("no_call_"))
+@dp.message_callback(lambda c: c.payload.startswith("no_call_"))
 async def no_call_confirmation(event: MessageCallback):
     """Отметка 'Не звонить для подтверждения'"""
     appointment_id = int(event.callback.payload.split("_")[1])
@@ -584,7 +580,7 @@ async def no_call_confirmation(event: MessageCallback):
 
 # ==================== НАВИГАЦИЯ ====================
 
-@dp.message_callback(F.callback.payload == "back_to_main")
+@dp.message_callback(lambda c: c.payload == "back_to_main")
 async def back_to_main(event: MessageCallback):
     """Возврат в главное меню"""
     await event.message.delete()
@@ -594,7 +590,7 @@ async def back_to_main(event: MessageCallback):
         attachments=[get_main_menu_keyboard().as_markup()]
     )
 
-@dp.message_callback(F.callback.payload == "back_to_services")
+@dp.message_callback(lambda c: c.payload == "back_to_services")
 async def back_to_services(event: MessageCallback):
     """Возврат к списку услуг"""
     await event.message.delete()
@@ -604,12 +600,10 @@ async def back_to_services(event: MessageCallback):
         attachments=[get_services_keyboard().as_markup()]
     )
 
-@dp.message_callback(F.callback.payload == "back_to_masters")
+@dp.message_callback(lambda c: c.payload == "back_to_masters")
 async def back_to_masters(event: MessageCallback):
     """Возврат к списку мастеров"""
     await event.message.delete()
-    # Получаем service_id из последнего callback
-    # Для простоты, возвращаем к услугам
     await event.message.answer(
         text="📅 **Выберите услугу:**\n\n"
              "Наши услуги:",
@@ -618,7 +612,7 @@ async def back_to_masters(event: MessageCallback):
 
 # ==================== АДМИН ПАНЕЛЬ ====================
 
-@dp.message_callback(F.callback.payload == "admin_pending")
+@dp.message_callback(lambda c: c.payload == "admin_pending")
 async def admin_pending(event: MessageCallback):
     """Показать ожидающие записи"""
     user_id = event.chat_id
@@ -642,14 +636,14 @@ async def admin_pending(event: MessageCallback):
         text += f"#{appt['id']} - {appt['user_name']}\n"
         text += f"   Услуга: {appt['service_name']}\n"
         text += f"   Мастер: {appt['master_name']}\n"
-        text += f"   Время: {appt['datetime']}\n\n"
+        text += f"   Время: {appt['appointment_time']}\n\n"
     
     await event.message.answer(
         text=text,
         attachments=[get_admin_menu_keyboard().as_markup()]
     )
 
-@dp.message_callback(F.callback.payload == "admin_confirmed")
+@dp.message_callback(lambda c: c.payload == "admin_confirmed")
 async def admin_confirmed(event: MessageCallback):
     """Показать подтвержденные записи"""
     user_id = event.chat_id
@@ -673,14 +667,14 @@ async def admin_confirmed(event: MessageCallback):
         text += f"#{appt['id']} - {appt['user_name']}\n"
         text += f"   Услуга: {appt['service_name']}\n"
         text += f"   Мастер: {appt['master_name']}\n"
-        text += f"   Время: {appt['datetime']}\n\n"
+        text += f"   Время: {appt['appointment_time']}\n\n"
     
     await event.message.answer(
         text=text,
         attachments=[get_admin_menu_keyboard().as_markup()]
     )
 
-@dp.message_callback(F.callback.payload == "admin_cancelled")
+@dp.message_callback(lambda c: c.payload == "admin_cancelled")
 async def admin_cancelled(event: MessageCallback):
     """Показать отмененные записи"""
     user_id = event.chat_id
@@ -704,14 +698,14 @@ async def admin_cancelled(event: MessageCallback):
         text += f"#{appt['id']} - {appt['user_name']}\n"
         text += f"   Услуга: {appt['service_name']}\n"
         text += f"   Мастер: {appt['master_name']}\n"
-        text += f"   Время: {appt['datetime']}\n\n"
+        text += f"   Время: {appt['appointment_time']}\n\n"
     
     await event.message.answer(
         text=text,
         attachments=[get_admin_menu_keyboard().as_markup()]
     )
 
-@dp.message_callback(F.callback.payload == "admin_all")
+@dp.message_callback(lambda c: c.payload == "admin_all")
 async def admin_all(event: MessageCallback):
     """Показать все записи"""
     user_id = event.chat_id
@@ -736,7 +730,7 @@ async def admin_all(event: MessageCallback):
         text += f"{status_emoji} #{appt['id']} - {appt['user_name']}\n"
         text += f"   Услуга: {appt['service_name']}\n"
         text += f"   Мастер: {appt['master_name']}\n"
-        text += f"   Время: {appt['datetime']}\n"
+        text += f"   Время: {appt['appointment_time']}\n"
         text += f"   Статус: {appt['status']}\n\n"
     
     await event.message.answer(
@@ -744,10 +738,9 @@ async def admin_all(event: MessageCallback):
         attachments=[get_admin_menu_keyboard().as_markup()]
     )
 
-@dp.message_callback(F.callback.payload.startswith("admin_confirm_"))
+@dp.message_callback(lambda c: c.payload.startswith("admin_confirm_"))
 async def admin_confirm_appointment(event: MessageCallback):
     """Подтверждение записи администратором"""
-    # Исправлено: правильный парсинг appointment_id из payload
     parts = event.callback.payload.split("_")
     appointment_id = int(parts[2])
     
@@ -764,7 +757,7 @@ async def admin_confirm_appointment(event: MessageCallback):
         text=f"✅ **Запись подтверждена!**\n\n"
              f"Клиент: {appointment['user_name']}\n"
              f"Услуга: {appointment['service_name']}\n"
-             f"Время: {appointment['datetime']}",
+             f"Время: {appointment['appointment_time']}",
         attachments=[get_admin_menu_keyboard().as_markup()]
     )
     
@@ -775,7 +768,7 @@ async def admin_confirm_appointment(event: MessageCallback):
             text=f"✅ **Ваша запись подтверждена!**\n\n"
                  f"Услуга: {appointment['service_name']}\n"
                  f"Мастер: {appointment['master_name']}\n"
-                 f"Время: {appointment['datetime']}\n\n"
+                 f"Время: {appointment['appointment_time']}\n\n"
                  f"Ждем вас в нашем салоне!",
             attachments=[get_main_menu_keyboard().as_markup()]
         )
@@ -785,10 +778,9 @@ async def admin_confirm_appointment(event: MessageCallback):
     # Логирование уведомления
     add_notification_log(appointment_id, "confirmed_by_admin")
 
-@dp.message_callback(F.callback.payload.startswith("admin_cancel_"))
+@dp.message_callback(lambda c: c.payload.startswith("admin_cancel_"))
 async def admin_cancel_appointment(event: MessageCallback):
     """Отмена записи администратором"""
-    # Исправлено: правильный парсинг appointment_id из payload
     parts = event.callback.payload.split("_")
     appointment_id = int(parts[2])
     
@@ -805,7 +797,7 @@ async def admin_cancel_appointment(event: MessageCallback):
         text=f"❌ **Запись отменена**\n\n"
              f"Клиент: {appointment['user_name']}\n"
              f"Услуга: {appointment['service_name']}\n"
-             f"Время: {appointment['datetime']}",
+             f"Время: {appointment['appointment_time']}",
         attachments=[get_admin_menu_keyboard().as_markup()]
     )
     
@@ -815,7 +807,7 @@ async def admin_cancel_appointment(event: MessageCallback):
             chat_id=appointment['user_id'],
             text=f"❌ **Ваша запись отменена**\n\n"
                  f"Услуга: {appointment['service_name']}\n"
-                 f"Время: {appointment['datetime']}\n\n"
+                 f"Время: {appointment['appointment_time']}\n\n"
                  f"Вы можете записаться снова в любое время.",
             attachments=[get_main_menu_keyboard().as_markup()]
         )
@@ -850,7 +842,7 @@ async def send_notifications():
                      f"Завтра у вас запись:\n"
                      f"Услуга: {appt['service_name']}\n"
                      f"Мастер: {appt['master_name']}\n"
-                     f"Время: {appt['datetime']}\n\n"
+                     f"Время: {appt['appointment_time']}\n\n"
                      f"Ждем вас!",
                 attachments=[get_main_menu_keyboard().as_markup()]
             )
@@ -875,7 +867,7 @@ async def send_notifications():
                      f"Через 2 часа у вас запись:\n"
                      f"Услуга: {appt['service_name']}\n"
                      f"Мастер: {appt['master_name']}\n"
-                     f"Время: {appt['datetime']}\n\n"
+                     f"Время: {appt['appointment_time']}\n\n"
                      f"Не опаздывайте!",
                 attachments=[get_main_menu_keyboard().as_markup()]
             )
